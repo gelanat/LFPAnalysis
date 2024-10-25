@@ -113,8 +113,8 @@ def make_seed_target_df(elec_df, epochs, source_roi, target_roi):
     seed_target_df = pd.DataFrame(columns=['seed', 'target'], index=['l', 'r'])
 
     for hemi in ['l', 'r']:
-        source_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.salman_region==source_roi)].label.values
-        target_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.salman_region==target_roi)].label.values
+        source_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.gelana_region==source_roi)].label.values
+        target_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.gelana_region==target_roi)].label.values
         
         if (len(source_ix) == 0) | (len(target_ix)==0):
             seed_target_df['seed'][hemi] = []

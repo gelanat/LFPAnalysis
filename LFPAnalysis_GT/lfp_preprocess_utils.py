@@ -8,7 +8,7 @@ import neurodsp
 from neurodsp.spectral import compute_spectrum
 import mne
 from glob import glob
-from LFPAnalysis import nlx_utils, lfp_preprocess_utils, iowa_utils
+from LFPAnalysis_GT import nlx_utils, lfp_preprocess_utils, iowa_utils
 import pandas as pd
 from mne.filter import next_fast_len
 from scipy.signal import hilbert, find_peaks, peak_widths, convolve

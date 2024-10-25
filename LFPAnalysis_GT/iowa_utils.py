@@ -1,7 +1,7 @@
 import pandas as pd 
 import numpy as np 
 from itertools import chain
-from LFPAnalysis import lfp_preprocess_utils
+from LFPAnalysis_GT import lfp_preprocess_utils
 
 def extract_names_connect_table(connect_table_path):
     """

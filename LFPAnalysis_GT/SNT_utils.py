@@ -112,7 +112,7 @@ def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, he
     if plot_alignment:
         sig_indices = [index for index,value in enumerate(timestamp) if value > 0 and value < 2000]
         neu_indices = [index for index,value in enumerate(neural_ts) if value > 0 and value < 2000]
-
+        plt.figure()
         plt.plot(timestamp[sig_indices], sig[sig_indices])
         plt.plot(neural_ts[neu_indices], np.ones_like(neural_ts[neu_indices])+1, 'o', markersize=3)
         plt.title("Photodiode " + subj_id)

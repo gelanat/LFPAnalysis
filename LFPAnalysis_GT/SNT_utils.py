@@ -13,8 +13,10 @@ def parse_logfile(logfile_path):
     returns:
     pd.dataframe
     """
+    # initialize lists to hold parsed data
+    decision_trial_start, non_decision_trial_start, choice_start, rt, key_pressed, photodiode_status, space_press_time = [], [], [], [], [], [], []
     
-    decision_trial_start, non_decision_trial_start, choice_start, rt, key_pressed, photodiode = [], [], [], [], [], []
+    # placeholders for tracking events
     last_decision_start = None
     current_trial_type = None
 
@@ -40,7 +42,8 @@ def parse_logfile(logfile_path):
                     choice_start.append(None)  # placeholder
                     rt.append(0)  # initialize with 0 for no response case
                     key_pressed.append(None)
-                    photodiode.append('white.png')
+                    photodiode_status.append('white.png')
+                    space_press_time.append(None)
                 elif 'blank.png' in tokens[2]:
                     # non-decision trial start
                     current_trial_type = 'narration'
@@ -49,7 +52,8 @@ def parse_logfile(logfile_path):
                     choice_start.append(None)
                     rt.append(None)
                     key_pressed.append(None)
-                    photodiode.append('blank.png')
+                    photodiode_status.append('blank.png')
+                    space_press_time.append(None)
 
             # check for the first valid key press (1 or 2) after a decision trial start to calculate reaction time
             elif event_type == 'DATA ' and 'Keypress: ' in tokens[2]:
@@ -63,24 +67,27 @@ def parse_logfile(logfile_path):
                     key_pressed[-1] = key_info  # capture key pressed
                     last_decision_start = None  # reset after capturing first valid response
 
-                # if not a decision trial, record the key pressed for non-decision trials
-                elif current_trial_type == 'narration':
-                    key_pressed[-1] = key_info
+                # if it's a non-decision trial and the key is "space," record the timestamp
+                elif current_trial_type == 'narration' and key_info == 'space':
+                    space_press_time[-1] = timestamp
 
+    # build the dataframe with each row aligned to one trial (either decision or narration)
     parsed_data = pd.DataFrame({
         'trial': range(1, len(decision_trial_start) + 1),
         'non_decision_trial_start': non_decision_trial_start,
+        'space_press_time': space_press_time,
         'decision_trial_start': decision_trial_start,
         'choice_start': choice_start,
         'rt': rt,
         'key_pressed': key_pressed,
-        'photodiode': photodiode
+        'photodiode': photodiode_status
     })
 
     # rounding?
     parsed_data = parsed_data.apply(lambda x: x.round(4) if x.dtype.kind in 'fc' else x)
 
     return parsed_data
+
 
 def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, height=0.5, plot_alignment=True):
     sig = np.squeeze(sync_utils.moving_average(photodiode_data._data, n=smoothSize))

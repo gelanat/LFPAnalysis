@@ -29,7 +29,7 @@ def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
     # data_dir = pkg_resources.resource_filename('LFPAnalysis', '../data')
 
     # THIS IS FOR MINERVA ONLY
-    file_path = '/hpc/users/tostag01/resources/LFPAnalysis_GT/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
+    file_path = '/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
     # print(file_path)
     YBA_ROI_labels = pd.read_excel(file_path)
     YBA_ROI_labels['Long.name'] = YBA_ROI_labels['Long.name'].str.lower().str.replace(" ", "")

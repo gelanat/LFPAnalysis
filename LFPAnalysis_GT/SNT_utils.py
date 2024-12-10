@@ -90,6 +90,7 @@ def parse_logfile(logfile_path):
 
 
 def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, height=0.5, plot_alignment=True):
+    preproc_dir = f'{'/sc/arion/projects/OlfMem/tostag01/SocialNav/preproc/'}{subj_id}'
     sig = np.squeeze(sync_utils.moving_average(photodiode_data._data, n=smoothSize))
     timestamp = np.squeeze(np.arange(len(sig))/photodiode_data.info['sfreq'])
     sig = scipy.stats.zscore(sig)
@@ -117,11 +118,12 @@ def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, he
     print(f'Max rval with slope of {slope} and offset of {offset}')
 
     if plot_alignment:
-        sig_indices = [index for index,value in enumerate(timestamp) if value > 0 and value < 2000]
-        neu_indices = [index for index,value in enumerate(neural_ts) if value > 0 and value < 2000]
+        sig_indices = [index for index,value in enumerate(timestamp) if value > 0 and value < 1000]
+        neu_indices = [index for index,value in enumerate(neural_ts) if value > 0 and value < 1000]
         plt.figure()
         plt.plot(timestamp[sig_indices], sig[sig_indices])
-        plt.plot(neural_ts[neu_indices], np.ones_like(neural_ts[neu_indices])+1, 'o', markersize=3)
+        plt.plot(neural_ts[neu_indices], np.ones_like(neural_ts[neu_indices]), 'o', markersize=3)
         plt.title("Photodiode " + subj_id)
+        plt.savefig(f'{preproc_dir}/{subj_id}_photodiode_alignment.png', dpi=300)
 
     return slope, offset

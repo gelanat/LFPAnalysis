@@ -90,7 +90,8 @@ def parse_logfile(logfile_path):
 
 
 def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, height=0.5, plot_alignment=True):
-    preproc_dir = f'{'/sc/arion/projects/OlfMem/tostag01/SocialNav/preproc/'}{subj_id}'
+    preproc = '/sc/arion/projects/OlfMem/tostag01/SocialNav/preproc/'
+    preproc_dir = f'{preproc}{subj_id}'
     sig = np.squeeze(sync_utils.moving_average(photodiode_data._data, n=smoothSize))
     timestamp = np.squeeze(np.arange(len(sig))/photodiode_data.info['sfreq'])
     sig = scipy.stats.zscore(sig)

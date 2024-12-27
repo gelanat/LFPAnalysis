@@ -2338,19 +2338,25 @@ def compute_and_baseline_tfr(baseline_event, task_events, freqs, n_cycles, load_
             ied_ev_list = IED_df[ch_name].dropna().index.tolist()
             artifact_ev_list = artifact_df[ch_name].dropna().index.tolist() 
             for ev_ in ied_ev_list: 
+                if ev_ not in baseline_power.selection:
+                    continue
                 for ied_ in literal_eval(IED_df[ch_name].iloc[ev_]):
                     # remove 100 ms before 
                     ev_ix_start = np.max([0, np.floor((ied_- 0.1) * baseline_epochs_reref.info['sfreq'])]).astype(int)
                     # remove 100 ms after 
                     ev_ix_end = np.min([baseline_power.data.shape[-1], np.ceil((ied_ + 0.1) * baseline_epochs_reref.info['sfreq'])]).astype(int)
-                    baseline_power.data[ev_, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
+                    ev_idx = list(baseline_power.selection).index(ev_)
+                    baseline_power.data[ev_idx, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
             for ev_ in artifact_ev_list: 
+                if ev_ not in baseline_power.selection:
+                    continue
                 for artifact_ in literal_eval(artifact_df[ch_name].iloc[ev_]):
                     # remove 100 ms before 
                     ev_ix_start = np.max([0, np.floor((artifact_- 0.1) * baseline_epochs_reref.info['sfreq'])]).astype(int)
                     # remove 100 ms after
                     ev_ix_end = np.min([baseline_power.data.shape[-1], np.ceil((artifact_ + 0.1) * baseline_epochs_reref.info['sfreq'])]).astype(int)
-                    baseline_power.data[ev_, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
+                    ev_idx = list(baseline_power.selection).index(ev_)
+                    baseline_power.data[ev_idx, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
     
     # remove epochs from memory
     del baseline_epochs_reref
@@ -2388,19 +2394,25 @@ def compute_and_baseline_tfr(baseline_event, task_events, freqs, n_cycles, load_
                 ied_ev_list = IED_df[ch_name].dropna().index.tolist()
                 artifact_ev_list = artifact_df[ch_name].dropna().index.tolist() 
                 for ev_ in ied_ev_list: 
+                    if ev_ not in temp_pow.selection:
+                        continue
                     for ied_ in literal_eval(IED_df[ch_name].iloc[ev_]):
                         # remove 100 ms before 
                         ev_ix_start = np.max([0, np.floor((ied_- 0.1) * event_epochs_reref.info['sfreq'])]).astype(int)
                         # remove 100 ms after
                         ev_ix_end = np.min([temp_pow.data.shape[-1], np.ceil((ied_ + 0.1) * event_epochs_reref.info['sfreq'])]).astype(int)
-                        temp_pow.data[ev_, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
-                for ev_ in artifact_ev_list: 
+                        ev_idx = list(temp_pow.selection).index(ev_)
+                        temp_pow.data[ev_idx, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan
+                for ev_ in artifact_ev_list:
+                    if ev_ not in temp_pow.selection:
+                        continue
                     for artifact_ in literal_eval(artifact_df[ch_name].iloc[ev_]):
                         # remove 100 ms before 
                         ev_ix_start = np.max([0, np.floor((artifact_- 0.1) * event_epochs_reref.info['sfreq'])]).astype(int)
                         # remove 100 ms after
                         ev_ix_end = np.min([temp_pow.data.shape[-1], np.ceil((artifact_ + 0.1) * event_epochs_reref.info['sfreq'])]).astype(int)
-                        temp_pow.data[ev_, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan    
+                        ev_idx = list(temp_pow.selection).index(ev_)
+                        temp_pow.data[ev_idx, ch_ix, :, ev_ix_start:ev_ix_end] = np.nan    
     
         # Compute first pass of baseline
         baseline_corrected_power = baseline_trialwise_TFR(data=temp_pow.data, include_epoch_in_baseline=False, 

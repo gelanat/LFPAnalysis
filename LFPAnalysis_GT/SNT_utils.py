@@ -89,7 +89,7 @@ def parse_logfile(logfile_path):
     return parsed_data
 
 
-def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, height=0.5, plot_alignment=True):
+def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, height=0.5, plot_alignment=True, plot_segment=500):
     preproc = '/sc/arion/projects/OlfMem/tostag01/SocialNav/preproc/'
     preproc_dir = f'{preproc}{subj_id}'
     sig = np.squeeze(sync_utils.moving_average(photodiode_data._data, n=smoothSize))
@@ -119,8 +119,8 @@ def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, he
     print(f'Max rval with slope of {slope} and offset of {offset}')
 
     if plot_alignment:
-        sig_indices = [index for index,value in enumerate(timestamp) if value > 0 and value < 1000]
-        neu_indices = [index for index,value in enumerate(neural_ts) if value > 0 and value < 1000]
+        sig_indices = [index for index,value in enumerate(timestamp) if value > 0 and value < plot_segment]
+        neu_indices = [index for index,value in enumerate(neural_ts) if value > 0 and value < plot_segment]
         plt.figure()
         plt.plot(timestamp[sig_indices], sig[sig_indices])
         plt.plot(neural_ts[neu_indices], np.ones_like(neural_ts[neu_indices]), 'o', markersize=3)
@@ -128,3 +128,73 @@ def synchronize(beh_ts, photodiode_data, subj_id, smoothSize=15, windSize=15, he
         plt.savefig(f'{preproc_dir}/{subj_id}_photodiode_alignment.png', dpi=300)
 
     return slope, offset
+
+
+def visualize_photodiode_and_behavior(
+    photodiode_data, 
+    time_df, 
+    subj_id, 
+    slope, 
+    offset, 
+    smoothSize=15, 
+    height=0.5, 
+    plot_save_path=None, 
+    segment=None
+):
+    """
+    visualizes the photodiode signal alongside behavioral timestamps with slope and offset correction.
+
+    args:
+        photodiode_data (raw): mne raw object containing the photodiode signal.
+        time_df (dataframe): parsed logfile containing behavioral timestamps.
+        subj_id (str): subject identifier.
+        slope (float): slope from synchronization.
+        offset (float): offset from synchronization.
+        smoothSize (int): window size for moving average smoothing.
+        height (float): threshold for detecting rising edges.
+        plot_save_path (str): path to save the plot (optional).
+        segment (tuple): start and end times in seconds (e.g., (0, 100)). visualizes the full signal if none.
+    """
+    # get photodiode signal and timestamps
+    sfreq = photodiode_data.info['sfreq']
+    raw_signal = photodiode_data.get_data().squeeze()
+    smoothed_signal = sync_utils.moving_average(raw_signal, n=smoothSize)
+    smoothed_signal = scipy.stats.zscore(smoothed_signal)
+    timestamps = np.arange(len(smoothed_signal)) / sfreq
+
+    # apply segment filtering if specified
+    if segment:
+        start_idx = int(segment[0] * sfreq)
+        end_idx = int(segment[1] * sfreq)
+        timestamps = timestamps[start_idx:end_idx]
+        smoothed_signal = smoothed_signal[start_idx:end_idx]
+
+    # correct behavioral timestamps with slope and offset
+    time_df['corrected_decision_trial_start'] = time_df['decision_trial_start'] * slope + offset
+    time_df['corrected_choice_start'] = time_df['choice_start'] * slope + offset
+
+    # detect rising edges in the specified segment
+    rising_edges = np.where((smoothed_signal[:-1] <= height) & (smoothed_signal[1:] > height))[0]
+    photodiode_events = timestamps[rising_edges]
+
+    # plot photodiode signal with annotations
+    plt.figure(figsize=(15, 6))
+    plt.plot(timestamps, smoothed_signal, label='photodiode signal', alpha=0.8)
+    plt.scatter(photodiode_events, [height] * len(photodiode_events), color='r', label='rising edges', zorder=5)
+    for _, row in time_df.iterrows():
+        if row['corrected_decision_trial_start'] is not None and segment and segment[0] <= row['corrected_decision_trial_start'] <= segment[1]:
+            plt.axvline(row['corrected_decision_trial_start'], color='g', linestyle='--', label='corrected decision start' if 'corrected decision start' not in plt.gca().get_legend_handles_labels()[1] else "")
+        if row['corrected_choice_start'] is not None and segment and segment[0] <= row['corrected_choice_start'] <= segment[1]:
+            plt.axvline(row['corrected_choice_start'], color='b', linestyle='-.', label='corrected button press' if 'corrected button press' not in plt.gca().get_legend_handles_labels()[1] else "")
+
+    plt.xlabel('time (s)')
+    plt.ylabel('z-scored signal')
+    plt.title(f'photodiode signal and corrected behavioral events ({subj_id}) - segment {segment if segment else "full"}')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    # save or show the plot
+    if plot_save_path:
+        plt.savefig(plot_save_path, dpi=300)
+    plt.show()

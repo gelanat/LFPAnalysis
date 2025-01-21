@@ -184,7 +184,12 @@ def baseline_trialwise_TFR(data=None, baseline_mne=None, mode='zscore', include_
 
     # Compute mean and std across all time points for each frequency and electrode
     m_ = np.nanmean(baseline_data_concat, axis=-1)
-    std_ = np.nanstd(baseline_data_concat, axis=-1)
+    # std_ = np.nanstd(baseline_data_concat, axis=-1)
+    # 12/30/2024: I think that computing std across events like this leads to very large denominators and thus very small z-scores
+    # conceptually, this is fine, but it's harder to interpret and reviewers will kind of ignorantly complain about small z-scores. 
+    # So, I will first compute the mean across timepoints and then compute the std across events
+    std_ = np.squeeze(np.nanstd(np.nanmean(baseline_data, axis=time_axis, keepdims=True), axis=ev_axis))
+
 
     # 2. Expand the array to time and events 
     m = np.expand_dims(np.expand_dims(m_, axis=m_.ndim), axis=0)

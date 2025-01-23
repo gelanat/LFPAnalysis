@@ -198,3 +198,28 @@ def visualize_photodiode_and_behavior(
     if plot_save_path:
         plt.savefig(plot_save_path, dpi=300)
     plt.show()
+
+
+def add_next_narration(df):
+    next_non_decision_times = []
+
+    for idx, row in df.iterrows():
+        # if this row corresponds to a decision trial with a valid choice
+        if pd.notna(row['choice_start']):
+            # find the next non-decision trial after the current index
+            next_non_decision = df.loc[idx+1:][df['non_decision_trial_start'].notna()]
+            
+            if not next_non_decision.empty:
+                # append the time of the first subsequent non-decision trial
+                next_non_decision_times.append(next_non_decision['non_decision_trial_start'].iloc[0])
+            else:
+                # no subsequent non-decision trial found, append NaN
+                next_non_decision_times.append(None)
+        else:
+            # for non-decision trials or decision trials without a valid choice, append NaN
+            next_non_decision_times.append(None)
+    
+    # add the list as a new column in the DataFrame
+    df['next_non_decision_trial_start'] = next_non_decision_times
+
+    return df

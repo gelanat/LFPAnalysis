@@ -5,7 +5,7 @@ import scipy as sp
 import math
 import pandas as pd
 import mne
-import pickle 
+import pickle
 import joblib
 import fooof
 from fooof import FOOOFGroup
@@ -13,6 +13,11 @@ from matplotlib.backends.backend_pdf import PdfPages
 import os
 import pycatch22
 import re
+from pathlib import Path
+
+# YBA ROI lookup table ships with the package (sibling to this module).
+# Override with the `LFPANALYSIS_YBA_PATH` env var if you need a custom atlas.
+_DEFAULT_YBA_XLSX = Path(__file__).resolve().parent / "YBA_ROI_labelled.xlsx"
 
 
 def _norm_label(s):
@@ -27,11 +32,22 @@ def _norm_label(s):
     return s if s else np.nan
 
 
-def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
+def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual', yba_path=None):
     """
     Grab specific ROI for the channel you are looking at.
+
+    Parameters
+    ----------
+    yba_path : str | Path, optional
+        Path to the YBA_ROI_labelled.xlsx atlas. If None, falls back to
+        the `LFPANALYSIS_YBA_PATH` env var, and then to the packaged copy
+        that ships alongside this module.
     """
-    file_path = '/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
+    file_path = Path(
+        yba_path
+        or os.environ.get("LFPANALYSIS_YBA_PATH")
+        or _DEFAULT_YBA_XLSX
+    )
     YBA_ROI_labels = pd.read_excel(file_path).copy()
 
     # normalize ROI lookup table once

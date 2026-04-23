@@ -13,99 +13,168 @@ from matplotlib.backends.backend_pdf import PdfPages
 import os
 import pycatch22
 import pkg_resources
+import re
 
 
+def _norm_label(s):
+    """Robust atlas-label normalization."""
+    if pd.isna(s):
+        return np.nan
+    s = str(s).strip().lower()
+    if s in {"", "nan", "none"}:
+        return np.nan
+    # remove all non-alphanumeric characters: spaces, underscores, hyphens, etc.
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s if s else np.nan
 
-# There are some things that MNE is not that good at, or simply does not do. Let's write our own code for these. 
+
 def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
-    
     """
-    Grab specific roi for the channel you are looking at 
+    Grab specific ROI for the channel you are looking at.
     """
-
-    # Load the YBA ROI labels, custom assigned by Salman: 
-    # file_path = pkg_resources.resource_filename('LFPAnalysis', 'data/YBA_ROI_labelled.xlsx')
-    # Get the path to the data directory
-    # data_dir = pkg_resources.resource_filename('LFPAnalysis', '../data')
-
-    # THIS IS FOR MINERVA ONLY
     file_path = '/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
-    # print(file_path)
-    YBA_ROI_labels = pd.read_excel(file_path)
-    YBA_ROI_labels['Long.name'] = YBA_ROI_labels['Long.name'].str.lower().str.replace(" ", "")
+    YBA_ROI_labels = pd.read_excel(file_path).copy()
+
+    # normalize ROI lookup table once
+    YBA_ROI_labels["Long.name_norm"] = YBA_ROI_labels["Long.name"].apply(_norm_label)
+
+    # normalize labels in electrode dataframe
+    elec_data = elec_data.copy()
+    elec_data["label_norm"] = elec_data["label"].astype(str).str.strip().str.lower()
+
+    chan_name_norm = str(chan_name).strip().lower()
+    row = elec_data.loc[elec_data["label_norm"] == chan_name_norm]
+
+    if row.empty:
+        return "Unknown"
+
+    row = row.iloc[0]
+
+    YBA_label = _norm_label(row.get("YBA_1", np.nan))
+    manual_label = _norm_label(row.get(manual_col, np.nan))
 
     roi = np.nan
-    NMM_label = elec_data[elec_data.label==chan_name].NMM.str.lower().str.strip()
-    BN246_label = elec_data[elec_data.label==chan_name].BN246.str.lower().str.strip()
 
-    # Account for individual differences in labelling: 
-    YBA_label = elec_data[elec_data.label==chan_name].YBA_1.str.lower().str.replace(" ", "")
-    manual_label = elec_data[elec_data.label==chan_name][manual_col].str.lower().str.replace(" ", "")
-
-    # Only NMM assigns entorhinal cortex 
-    if NMM_label.str.contains('entorhinal').iloc[0]:
-        roi = 'EC'
-
-    # First priority: Use YBA labels if there is no manual label
-    if pd.isna(manual_label).iloc[0]:
-        try:
-            roi = YBA_ROI_labels[YBA_ROI_labels['Long.name']==YBA_label.values[0]].Custom.values[0]
-        except IndexError:
-            # This is probably white matter or out of brain, but not manually labelled as such
-            roi = np.nan
+    # first priority: use YBA if manual label missing
+    if pd.isna(manual_label):
+        if not pd.isna(YBA_label):
+            match = YBA_ROI_labels.loc[YBA_ROI_labels["Long.name_norm"] == YBA_label, "Custom"]
+            if not match.empty:
+                roi = match.iloc[0]
     else:
-        # Now look at the manual labels: 
-        if YBA_label.str.contains('unknown').iloc[0]:
-            # prioritize thalamus labels! Which are not present in YBA for some reason
-            if (manual_label.str.contains('thalamus').iloc[0]):
-                roi = 'THAL'
+        # if YBA says unknown, prioritize manual label
+        if (not pd.isna(YBA_label)) and ("unknown" in str(YBA_label)):
+            if "thalamus" in str(manual_label):
+                roi = "THAL"
             else:
-                try:
-                    roi = YBA_ROI_labels[YBA_ROI_labels['Long.name']==manual_label.values[0]].Custom.values[0]
-                except IndexError: 
-                    # This is probably white matter or out of brain, and manually labelled as such
-                    roi = np.nan
-
-    # Next  use BN246 labels if still unlabeled
-    if pd.isna(roi):
-        # Just use the dumb BN246 label from LeGui, stripping out the hemisphere which we don't care too much about at the moment
-        if (BN246_label.str.contains('hipp').iloc[0]):
-            roi = 'HPC'
-        elif (BN246_label.str.contains('amyg').iloc[0]):
-            roi = 'AMY'
-        elif (BN246_label.str.contains('ins').iloc[0]):
-            roi = 'INS'
-        elif (BN246_label.str.contains('ifg').iloc[0]):
-            roi = 'IFG'
-        elif (BN246_label.str.contains('org').iloc[0]):
-            roi = 'OFC' 
-        elif (BN246_label.str.contains('mfg').iloc[0]):
-            roi = 'dlPFC'
-        elif (BN246_label.str.contains('sfg').iloc[0]):
-            roi = 'dmPFC'
+                match = YBA_ROI_labels.loc[YBA_ROI_labels["Long.name_norm"] == manual_label, "Custom"]
+                if not match.empty:
+                    roi = match.iloc[0]
+        else:
+            # if manual exists, try manual first, then YBA fallback
+            match = YBA_ROI_labels.loc[YBA_ROI_labels["Long.name_norm"] == manual_label, "Custom"]
+            if not match.empty:
+                roi = match.iloc[0]
+            elif not pd.isna(YBA_label):
+                match = YBA_ROI_labels.loc[YBA_ROI_labels["Long.name_norm"] == YBA_label, "Custom"]
+                if not match.empty:
+                    roi = match.iloc[0]
 
     if pd.isna(roi):
-        # Just use the dumb NMM label from LeGui, stripping out the hemisphere which we don't care too much about at the moment
-        if (NMM_label.str.contains('hippocampus').iloc[0]):
-            roi = 'HPC'
-        if (NMM_label.str.contains('amygdala').iloc[0]):
-            roi = 'AMY'
-        if (NMM_label.str.contains('acgc').iloc[0]):
-            roi = 'ACC'
-        if (NMM_label.str.contains('mcgc').iloc[0]):
-            roi = 'MCC'
-        if (NMM_label.str.contains('ofc').iloc[0]):
-            roi = 'OFC'
-        if (NMM_label.str.contains('mfg').iloc[0]):
-            roi = 'dlPFC'
-        if (NMM_label.str.contains('sfg').iloc[0]):
-            roi = 'dmPFC'  
-
-    if pd.isna(roi):
-        # This is mostly temporal gyrus
-        roi = 'Unknown'
+        roi = "Unknown"
 
     return roi
+
+# # There are some things that MNE is not that good at, or simply does not do. Let's write our own code for these. 
+# def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
+    
+#     """
+#     Grab specific roi for the channel you are looking at 
+#     """
+
+#     # Load the YBA ROI labels, custom assigned by Salman: 
+#     # file_path = pkg_resources.resource_filename('LFPAnalysis', 'data/YBA_ROI_labelled.xlsx')
+#     # Get the path to the data directory
+#     # data_dir = pkg_resources.resource_filename('LFPAnalysis', '../data')
+
+#     # THIS IS FOR MINERVA ONLY
+#     file_path = '/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
+#     # print(file_path)
+#     YBA_ROI_labels = pd.read_excel(file_path)
+#     YBA_ROI_labels['Long.name'] = YBA_ROI_labels['Long.name'].str.lower().str.replace(" ", "")
+
+#     roi = np.nan
+#     # NMM_label = elec_data[elec_data.label==chan_name].NMM.str.lower().str.strip()
+#     # BN246_label = elec_data[elec_data.label==chan_name].BN246.str.lower().str.strip()
+
+#     # Account for individual differences in labelling: 
+#     YBA_label = elec_data[elec_data.label==chan_name].YBA_1.str.lower().str.replace(" ", "")
+#     manual_label = elec_data[elec_data.label==chan_name][manual_col].str.lower().str.replace(" ", "")
+
+#     # # Only NMM assigns entorhinal cortex 
+#     # if NMM_label.str.contains('entorhinal').iloc[0]:
+#     #     roi = 'EC'
+
+#     # First priority: Use YBA labels if there is no manual label
+#     if pd.isna(manual_label).iloc[0]:
+#         try:
+#             roi = YBA_ROI_labels[YBA_ROI_labels['Long.name']==YBA_label.values[0]].Custom.values[0]
+#         except IndexError:
+#             # This is probably white matter or out of brain, but not manually labelled as such
+#             roi = np.nan
+#     else:
+#         # Now look at the manual labels: 
+#         if YBA_label.str.contains('unknown').iloc[0]:
+#             # prioritize thalamus labels! Which are not present in YBA for some reason
+#             if (manual_label.str.contains('thalamus').iloc[0]):
+#                 roi = 'THAL'
+#             else:
+#                 try:
+#                     roi = YBA_ROI_labels[YBA_ROI_labels['Long.name']==manual_label.values[0]].Custom.values[0]
+#                 except IndexError: 
+#                     # This is probably white matter or out of brain, and manually labelled as such
+#                     roi = np.nan
+
+#     # Next  use BN246 labels if still unlabeled
+#     # if pd.isna(roi):
+#     #     # Just use the dumb BN246 label from LeGui, stripping out the hemisphere which we don't care too much about at the moment
+#     #     if (BN246_label.str.contains('hipp').iloc[0]):
+#     #         roi = 'HPC'
+#     #     elif (BN246_label.str.contains('amyg').iloc[0]):
+#     #         roi = 'AMY'
+#     #     elif (BN246_label.str.contains('ins').iloc[0]):
+#     #         roi = 'INS'
+#     #     elif (BN246_label.str.contains('ifg').iloc[0]):
+#     #         roi = 'IFG'
+#     #     elif (BN246_label.str.contains('org').iloc[0]):
+#     #         roi = 'OFC' 
+#     #     elif (BN246_label.str.contains('mfg').iloc[0]):
+#     #         roi = 'dlPFC'
+#     #     elif (BN246_label.str.contains('sfg').iloc[0]):
+#     #         roi = 'dmPFC'
+
+#     # if pd.isna(roi):
+#     #     # Just use the dumb NMM label from LeGui, stripping out the hemisphere which we don't care too much about at the moment
+#     #     if (NMM_label.str.contains('hippocampus').iloc[0]):
+#     #         roi = 'HPC'
+#     #     if (NMM_label.str.contains('amygdala').iloc[0]):
+#     #         roi = 'AMY'
+#     #     if (NMM_label.str.contains('acgc').iloc[0]):
+#     #         roi = 'ACC'
+#     #     if (NMM_label.str.contains('mcgc').iloc[0]):
+#     #         roi = 'MCC'
+#     #     if (NMM_label.str.contains('ofc').iloc[0]):
+#     #         roi = 'OFC'
+#     #     if (NMM_label.str.contains('mfg').iloc[0]):
+#     #         roi = 'dlPFC'
+#     #     if (NMM_label.str.contains('sfg').iloc[0]):
+#     #         roi = 'dmPFC'  
+
+#     if pd.isna(roi):
+#         # This is mostly temporal gyrus
+#         roi = 'Unknown'
+
+#     return roi
 
 def select_picks_rois(elec_data, roi=None):
     """

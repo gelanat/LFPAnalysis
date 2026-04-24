@@ -11,8 +11,18 @@ import fooof
 from fooof import FOOOFGroup
 from matplotlib.backends.backend_pdf import PdfPages
 import os
+from pathlib import Path
 import pycatch22
 import re
+
+
+# YBA lookup table. Prefer the copy shipped next to this module (works after
+# `pip install -e .` regardless of where the repo is cloned); fall back to the
+# legacy hard-coded path for older checkouts.
+_YBA_XLSX_CANDIDATES = [
+    Path(__file__).parent / "YBA_ROI_labelled.xlsx",
+    Path("/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx"),
+]
 
 
 def _norm_label(s):
@@ -24,6 +34,10 @@ def _norm_label(s):
         return np.nan
     # remove all non-alphanumeric characters: spaces, underscores, hyphens, etc.
     s = re.sub(r"[^a-z0-9]+", "", s)
+    # Alias OFC word-order conventions: the YBA table uses "frontal orbital",
+    # but some older anatomy exports use "orbitofrontal". Normalize to the
+    # table form so both spellings hit the same row.
+    s = s.replace("orbitofrontal", "frontalorbital")
     return s if s else np.nan
 
 
@@ -31,7 +45,12 @@ def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
     """
     Grab specific ROI for the channel you are looking at.
     """
-    file_path = '/hpc/users/tostag01/LFPAnalysis/LFPAnalysis_GT/YBA_ROI_labelled.xlsx'
+    file_path = next((p for p in _YBA_XLSX_CANDIDATES if p.exists()), None)
+    if file_path is None:
+        raise FileNotFoundError(
+            "YBA_ROI_labelled.xlsx not found; checked: "
+            + ", ".join(str(p) for p in _YBA_XLSX_CANDIDATES)
+        )
     YBA_ROI_labels = pd.read_excel(file_path).copy()
 
     # normalize ROI lookup table once
@@ -49,7 +68,10 @@ def select_rois_picks(elec_data, chan_name, manual_col='collapsed_manual'):
 
     row = row.iloc[0]
 
-    YBA_label = _norm_label(row.get("YBA_1", np.nan))
+    # Older labels_bp schemas carry the atlas column as `YBA` (no _1 suffix).
+    # Prefer `YBA_1` when present, otherwise fall back to `YBA`.
+    yba_raw = row.get("YBA_1") if ("YBA_1" in row.index) else row.get("YBA", np.nan)
+    YBA_label = _norm_label(yba_raw)
     manual_label = _norm_label(row.get(manual_col, np.nan))
 
     roi = np.nan

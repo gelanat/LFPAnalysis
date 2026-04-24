@@ -110,25 +110,24 @@ def make_seed_target_df(elec_df, epochs, source_roi, target_roi):
     
     """
     
-    seed_target_df = pd.DataFrame(columns=['seed', 'target'], index=['l', 'r'])
+    # Build rows in a dict and materialize the DataFrame once. Only hemispheres
+    # with non-empty seed AND target make it in, so there's no placeholder-cell
+    # state to mutate in place (which used to leave NaN cells under pandas
+    # copy-on-write and crashed downstream `len(cell)` checks).
+    elec_hemi = elec_df.hemisphere.astype(str).str.lower()
+    rows = {}
+    for hemi in ('l', 'r'):
+        source_labels = elec_df[(elec_hemi == hemi) & (elec_df.SNT_region == source_roi)].label.values
+        target_labels = elec_df[(elec_hemi == hemi) & (elec_df.SNT_region == target_roi)].label.values
+        if len(source_labels) == 0 or len(target_labels) == 0:
+            continue
+        seed_ix = mne.pick_channels(epochs.ch_names, source_labels)
+        target_ix = mne.pick_channels(epochs.ch_names, target_labels)
+        if len(seed_ix) == 0 or len(target_ix) == 0:
+            continue
+        rows[hemi] = {'seed': seed_ix, 'target': target_ix}
 
-    for hemi in ['l', 'r']:
-        source_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.SNT_region==source_roi)].label.values
-        target_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.SNT_region==target_roi)].label.values
-        
-        if (len(source_ix) == 0) | (len(target_ix)==0):
-            seed_target_df['seed'][hemi] = []
-            seed_target_df['target'][hemi] = []
-        else:   
-            seed_target_df['seed'][hemi] = mne.pick_channels(epochs.ch_names, source_ix)
-
-            seed_target_df['target'][hemi] = mne.pick_channels(epochs.ch_names, target_ix)
-
-    seed_target_df = seed_target_df[
-                (seed_target_df['seed'].map(lambda d: len(d) > 0)) & (seed_target_df['target'].map(lambda d: len(d) > 0))]
-
-    
-    return seed_target_df
+    return pd.DataFrame.from_dict(rows, orient='index', columns=['seed', 'target'])
     
 
 def amp_amp_coupling(mne_data, seed_to_target, freqs0, freqs1=None):

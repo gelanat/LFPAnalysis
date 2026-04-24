@@ -1986,11 +1986,11 @@ def _bin_channelwise_times_into_behav_evs(channel_dict_seconds, ev_starts, ev_en
     event_metadata = pd.DataFrame(columns=list(channel_dict_seconds.keys()), index=np.arange(len(time_bins)))
     for ch in list(channel_dict_seconds.keys()):
         for ev, val in allts[ch].items():
-            if len(val) > 1:    
+            if len(val) > 1:
                 event_metadata[ch].loc[ev] = val
-            else:
-                if ~np.isnan(val): 
-                    event_metadata[ch].loc[ev] = val
+            elif len(val) == 1 and not np.isnan(val).any():
+                # single IED in window — assign; skip empty / all-NaN cases
+                event_metadata[ch].loc[ev] = val
     # Replace all nan with Nones 
     event_metadata.where(pd.notna(event_metadata), None)
     return event_metadata

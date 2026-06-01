@@ -1130,6 +1130,7 @@ def compute_pac_grid(
     n_surr: int = 200,
     seed: int | None = 2025,
     filter_kind: str = "butter",
+    return_surrogates: bool = False,
 ) -> dict[str, Any]:
     """Publication-quality comodulogram over arbitrary (phase, amp) grids.
 
@@ -1164,6 +1165,14 @@ def compute_pac_grid(
     method, n_surr, seed, filter_kind
         Passed through to `compute_pac` per cell. See `compute_pac` for
         `filter_kind` semantics.
+    return_surrogates : bool
+        When True, also retain the full per-cell surrogate MI null and
+        return it under key `surr_grid` with shape `(n_surr, n_phase,
+        n_amp)`. Invalid / skipped cells are NaN. This is the only
+        quantity that cannot be reconstructed from the summary grids,
+        so persist it when a cluster-based permutation across the
+        comodulogram (or any re-derivation of z/p) may be needed later.
+        Memory cost ≈ `n_surr · n_phase · n_amp · 8` bytes.
 
     Returns
     -------
@@ -1171,6 +1180,8 @@ def compute_pac_grid(
         phase_centers, amp_centers : ndarray
         phase_bw : float
         amp_bw : float | "adaptive"
+        surr_grid : (n_surr, n_phase, n_amp) ndarray — only if
+            `return_surrogates=True`.
     """
     phase_centers = np.asarray(phase_centers, dtype=float)
     amp_centers = np.asarray(amp_centers, dtype=float)
@@ -1182,6 +1193,7 @@ def compute_pac_grid(
     p_grid = np.full((n_p, n_a), np.nan)
     cliff_grid = np.full((n_p, n_a), np.nan)
     valid_mask = np.zeros((n_p, n_a), dtype=bool)
+    surr_grid = np.full((int(n_surr), n_p, n_a), np.nan) if return_surrogates else None
     for i, pc in enumerate(phase_centers):
         pb = (float(pc - phase_bw / 2.0), float(pc + phase_bw / 2.0))
         if pb[0] <= 0:
@@ -1218,7 +1230,11 @@ def compute_pac_grid(
             z_grid[i, j] = r["z_pac"]
             p_grid[i, j] = r["p_value"]
             cliff_grid[i, j] = r.get("cliff_delta", float("nan"))
-    return {
+            if surr_grid is not None:
+                sm = np.asarray(r.get("surrogate_mi", []), dtype=float).ravel()
+                if sm.size == surr_grid.shape[0]:
+                    surr_grid[:, i, j] = sm
+    out = {
         "pac_grid": pac_grid,
         "z_grid": z_grid,
         "p_grid": p_grid,
@@ -1232,6 +1248,9 @@ def compute_pac_grid(
         "filter_kind": str(filter_kind),
         "fs": float(fs),
     }
+    if surr_grid is not None:
+        out["surr_grid"] = surr_grid
+    return out
 
 
 def synthetic_pac_signal(

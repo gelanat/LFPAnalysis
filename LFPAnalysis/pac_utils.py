@@ -837,6 +837,7 @@ def compute_pac(
     seed: int | None = 2025,
     bypass_bandwidth_check: bool = False,
     filter_kind: str = "butter",
+    filter_edge_s: float = 0.5,
 ) -> dict[str, Any]:
     """Compute phase-amplitude coupling with the requested backend.
 
@@ -874,6 +875,13 @@ def compute_pac(
           (phase='zero', fir_design='firwin', fir_window='hamming').
         No-op for tensorpac/pactools — those backends use their wrappers'
         internal filtering and ignore this argument.
+    filter_edge_s : float
+        Seconds trimmed from each end of the per-epoch Hilbert envelope before the
+        MI (the three tort backends), discarding band-pass edge transients. Default
+        0.5. To do *filter-before-crop* (filter a buffered signal, then keep only the
+        analysis window), pass a buffered `signal` and set `filter_edge_s` to the
+        buffer length — the trim then removes exactly the buffer, leaving a
+        clean-edged analysis window. No-op for tensorpac/pactools.
     """
     if filter_kind not in {"butter", "fir"}:
         raise ValueError(
@@ -882,11 +890,11 @@ def compute_pac(
     if not bypass_bandwidth_check:
         _check_pac_bandwidth(phase_band, amp_band)
     if method == "tort_block_resample":
-        return _compute_tort_block_resample(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind)
+        return _compute_tort_block_resample(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind, filter_edge_s=filter_edge_s)
     if method == "trial_shuffle":
-        return _compute_tort_trial_shuffle(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind)
+        return _compute_tort_trial_shuffle(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind, filter_edge_s=filter_edge_s)
     if method == "trial_shuffle_concatenated":
-        return _compute_tort_trial_shuffle_concatenated(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind)
+        return _compute_tort_trial_shuffle_concatenated(signal, fs, phase_band, amp_band, n_surr=n_surr, seed=seed, filter_kind=filter_kind, filter_edge_s=filter_edge_s)
     # tensorpac / pactools backends use their wrappers' internal filtering;
     # filter_kind doesn't apply and is silently ignored here.
     if method == "tensorpac_mi":
@@ -1130,6 +1138,7 @@ def compute_pac_grid(
     n_surr: int = 200,
     seed: int | None = 2025,
     filter_kind: str = "butter",
+    filter_edge_s: float = 0.5,
     return_surrogates: bool = False,
 ) -> dict[str, Any]:
     """Publication-quality comodulogram over arbitrary (phase, amp) grids.
@@ -1222,7 +1231,7 @@ def compute_pac_grid(
                     signal, fs=fs, phase_band=pb, amp_band=ab,
                     method=method, n_surr=n_surr, seed=seed,
                     bypass_bandwidth_check=adaptive_amp,
-                    filter_kind=filter_kind,
+                    filter_kind=filter_kind, filter_edge_s=filter_edge_s,
                 )
             except Exception:
                 continue
@@ -1246,6 +1255,7 @@ def compute_pac_grid(
         "amp_bw": amp_bw if adaptive_amp else float(amp_bw),
         "method": method,
         "filter_kind": str(filter_kind),
+        "filter_edge_s": float(filter_edge_s),
         "fs": float(fs),
     }
     if surr_grid is not None:

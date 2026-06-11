@@ -117,12 +117,14 @@ def make_seed_target_df(elec_df, epochs, source_roi, target_roi):
         target_ix = elec_df[(elec_df.hemisphere.str.lower()==hemi) & (elec_df.SNT_region==target_roi)].label.values
         
         if (len(source_ix) == 0) | (len(target_ix)==0):
-            seed_target_df['seed'][hemi] = []
-            seed_target_df['target'][hemi] = []
+            seed_target_df.at[hemi, 'seed'] = []
+            seed_target_df.at[hemi, 'target'] = []
         else:   
-            seed_target_df['seed'][hemi] = mne.pick_channels(epochs.ch_names, source_ix)
-
-            seed_target_df['target'][hemi] = mne.pick_channels(epochs.ch_names, target_ix)
+            # .at + list() avoid chained-assignment squeezing a single-channel
+            # region/hemi (1-element pick) into a 0-d scalar, which then breaks
+            # the len(d) filter below (TypeError: len() of unsized object).
+            seed_target_df.at[hemi, 'seed'] = list(mne.pick_channels(epochs.ch_names, source_ix))
+            seed_target_df.at[hemi, 'target'] = list(mne.pick_channels(epochs.ch_names, target_ix))
 
     seed_target_df = seed_target_df[
                 (seed_target_df['seed'].map(lambda d: len(d) > 0)) & (seed_target_df['target'].map(lambda d: len(d) > 0))]
@@ -413,8 +415,9 @@ def compute_surr_connectivity_epochs(mne_data, indices, metric, band, freqs, n_c
                                                        verbose='ERROR').get_data()[:, 0])
     if metric != 'granger':
         if n_pairs == 1:
-            # reshape data
-            surr_conn = surr_conn.reshape((surr_conn.shape[0], n_pairs))
+            # n_pairs==1: restore (n_pairs, n_times) so the buffer crop slices the
+            # TIME axis (was (n_times, 1) -> crop hit the size-1 pair axis -> empty).
+            surr_conn = surr_conn.reshape((n_pairs, surr_conn.shape[0]))
 
         # crop the buffer now:
         buf_rs = int((buf_ms/1000) * surr_mne.info['sfreq'])
@@ -567,8 +570,10 @@ def compute_connectivity(mne_data=None,
 
         if metric != 'granger':
             if n_pairs == 1:
-                # reshape data
-                pairwise_connectivity = pairwise_connectivity.reshape((pairwise_connectivity.shape[0], n_pairs))
+                # n_pairs==1 squeezes to (n_times,); restore (n_pairs, n_times) so
+                # the buffer crop below slices the TIME axis (was (n_times, 1) ->
+                # crop hit the size-1 pair axis -> empty (n_times, 0)).
+                pairwise_connectivity = pairwise_connectivity.reshape((n_pairs, pairwise_connectivity.shape[0]))
             # # crop the buffer now:
             buf_rs = int((buf_ms/1000) * mne_data.info['sfreq'])
             pairwise_connectivity = pairwise_connectivity[:, buf_rs:-buf_rs]
@@ -647,7 +652,7 @@ def compute_connectivity(mne_data=None,
                         if n_pairs == 1:
                             # reshape data
                             surr_conn = surr_conn.reshape((surr_conn.shape[0], n_pairs))
-                        # crop the surrogate: 
+                        # crop the surrogate:
                         surr_conn = surr_conn[:, buf_rs:-buf_rs]
 
                     surr_struct[:, :, ns] = surr_conn

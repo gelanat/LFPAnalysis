@@ -20,7 +20,7 @@ import mne
 from scipy.signal import hilbert
 from mne.filter import next_fast_len
 from tqdm import tqdm
-from scipy.stats import zscore
+from scipy.stats import zscore, circstd
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from joblib import delayed, Parallel
@@ -99,10 +99,210 @@ def swap_time_blocks(data, random_state=None):
     surr = np.array_split(data, cut_at, axis=-1)
     # revered elements
     surr.reverse()
-    
+
     return np.concatenate(surr, axis=-1)
 
-def make_seed_target_df(elec_df, epochs, source_roi, target_roi): 
+
+# ---------------------------------------------------------------------------
+# Phase transfer entropy (Lobier et al. 2014 NeuroImage; Hillebrand et al. 2016
+# PNAS dPTE normalisation). Phase-based, model-free directed connectivity.
+#
+# Aligned with the reference implementation used by Gattas et al. 2023
+# Nat Commun (github.com/Yassa-TNL/theta_physiology, TransferEntropy/
+# B001_TransferEntropy.m): instantaneous Hilbert phase, Scott's-rule circular
+# binning, fixed prediction delay, log2 (bits) Shannon entropies, and the
+# PTE = H(Y_t,Y_{t+d}) + H(Y_t,X_t) - H(Y_t) - H(Y_{t+d},Y_t,X_t) decomposition.
+#
+# Robustness choices that tighten the *estimator* without changing the
+# *definition* (callers can opt out): closed-right bin edges (the validated
+# pac_utils._tort_mi idiom, fixes the reference's linspace off-by-one);
+# boundary-safe (t, t+delta) pairing that never straddles trial boundaries;
+# all four entropy terms marginalised from one joint count tensor so they share
+# identical bin edges; and an effective-transfer-entropy surrogate for the
+# finite-sample positive bias (Marschinski & Kantz 2002).
+# ---------------------------------------------------------------------------
+
+PTE_MIN_BINS = 4
+PTE_MAX_BINS = 32
+PTE_MIN_PER_CELL = 5
+
+
+def scott_n_bins(phase, min_bins=PTE_MIN_BINS, max_bins=PTE_MAX_BINS):
+    """Scott's-rule bin count for circular phase, as in the reference.
+
+    ``n_bins = round(2*pi / (3.5 * circ_std(phase) / N**(1/3)))`` clamped to
+    ``[min_bins, max_bins]``. Degenerate (constant / too-short) phase falls back
+    to ``min_bins``.
+    """
+    phase = np.asarray(phase, dtype=float).ravel()
+    n = phase.size
+    if n < 2:
+        return int(min_bins)
+    sd = float(circstd(phase, high=np.pi, low=-np.pi))
+    bw = 3.5 * sd / (n ** (1.0 / 3.0))
+    if not np.isfinite(bw) or bw <= 0:
+        return int(min_bins)
+    nb = int(round(2.0 * np.pi / bw))
+    return int(np.clip(nb, min_bins, max_bins))
+
+
+def choose_pte_bins(phase_seed, phase_target, delay,
+                    min_per_cell=PTE_MIN_PER_CELL,
+                    min_bins=PTE_MIN_BINS, max_bins=PTE_MAX_BINS):
+    """Per-channel Scott bin counts, shrunk so the 3-D joint histogram is sampled.
+
+    Returns ``(n_bins_seed, n_bins_target, n_triples)`` or ``None`` if the window
+    is too short to form a single (t, t+delay) pair. The shrink keeps
+    ``min_per_cell * receiver_bins**2 * sender_bins <= n_triples`` for *both*
+    directions (each PTE direction squares its receiver's bin count).
+    """
+    ps = np.atleast_2d(np.asarray(phase_seed, dtype=float))
+    pt = np.atleast_2d(np.asarray(phase_target, dtype=float))
+    n_win = pt.shape[1]
+    delay = int(delay)
+    if n_win <= delay:
+        return None
+    n = ps.shape[0] * (n_win - delay)
+    nb_seed = scott_n_bins(ps.reshape(-1), min_bins, max_bins)
+    nb_target = scott_n_bins(pt.reshape(-1), min_bins, max_bins)
+    while max(nb_seed, nb_target) > min_bins and (
+        min_per_cell * nb_target * nb_target * nb_seed > n
+        or min_per_cell * nb_seed * nb_seed * nb_target > n
+    ):
+        if nb_seed >= nb_target:
+            nb_seed -= 1
+        else:
+            nb_target -= 1
+    return int(nb_seed), int(nb_target), int(n)
+
+
+def _digitize_phase(phase, n_bins):
+    """Map phase in (-pi, pi] to integer codes in [0, n_bins-1] (closed right)."""
+    edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    return np.clip(np.digitize(phase, edges) - 1, 0, n_bins - 1)
+
+
+def _shannon_entropy(p, base=2):
+    """Shannon entropy of a probability tensor; empty bins contribute 0."""
+    nz = p[p > 0]
+    if nz.size == 0:
+        return 0.0
+    logf = np.log2 if base == 2 else np.log
+    return float(-np.sum(nz * logf(nz)))
+
+
+def _phase_te_triples(phase_x, phase_y, delay):
+    """Boundary-safe (Y_t, Y_{t+delay}, X_t) samples pooled across trials.
+
+    Slices within each trial *before* flattening, so no (t, t+delay) pair ever
+    straddles a trial boundary. ``phase_x`` (sender) and ``phase_y`` (receiver)
+    are ``(n_trials, n_win)``. Returns ``None`` if ``n_win <= delay``.
+    """
+    n_win = phase_y.shape[1]
+    if n_win <= delay:
+        return None
+    yt = phase_y[:, : n_win - delay].reshape(-1)   # Y_t
+    yd = phase_y[:, delay:].reshape(-1)            # Y_{t+delay}
+    xt = phase_x[:, : n_win - delay].reshape(-1)   # X_t (aligned to Y_t)
+    return yt, yd, xt
+
+
+def phase_transfer_entropy(phase_x, phase_y, delay,
+                          n_bins_x=None, n_bins_y=None, base=2):
+    """Phase transfer entropy from X to Y, in bits (base 2) by default.
+
+    ``PTE_{X->Y} = H(Y_t, Y_{t+d}) + H(Y_t, X_t) - H(Y_t) - H(Y_{t+d}, Y_t, X_t)``
+    ``           = H(Y_{t+d} | Y_t) - H(Y_{t+d} | Y_t, X_t)``.
+
+    Parameters
+    ----------
+    phase_x, phase_y : array
+        Instantaneous phase in (-pi, pi], shape ``(n_trials, n_win)`` (1-D is
+        promoted to a single trial). ``phase_x`` is the sender, ``phase_y`` the
+        receiver whose future is predicted.
+    delay : int
+        Prediction delay in samples (the reference default is ``round(0.1*fs)``).
+    n_bins_x, n_bins_y : int | None
+        Sender / receiver bin counts. ``None`` derives them per channel via
+        Scott's rule (callers usually pass counts from :func:`choose_pte_bins`
+        so both directions of a pair share a fixed per-channel resolution).
+
+    Returns ``nan`` for non-finite phase or windows shorter than ``delay``.
+    """
+    phase_x = np.atleast_2d(np.asarray(phase_x, dtype=float))
+    phase_y = np.atleast_2d(np.asarray(phase_y, dtype=float))
+    if not (np.all(np.isfinite(phase_x)) and np.all(np.isfinite(phase_y))):
+        return float("nan")
+    triples = _phase_te_triples(phase_x, phase_y, int(delay))
+    if triples is None:
+        return float("nan")
+    yt, yd, xt = triples
+    n = yt.size
+    if n < 2:
+        return float("nan")
+    nby = int(n_bins_y) if n_bins_y is not None else scott_n_bins(np.concatenate([yt, yd]))
+    nbx = int(n_bins_x) if n_bins_x is not None else scott_n_bins(xt)
+    iy = _digitize_phase(yt, nby)
+    iyd = _digitize_phase(yd, nby)
+    ix = _digitize_phase(xt, nbx)
+    codes = np.ravel_multi_index((iyd, iy, ix), (nby, nby, nbx))
+    counts = np.bincount(codes, minlength=nby * nby * nbx).astype(float)
+    p3 = counts.reshape(nby, nby, nbx) / n            # P(Y_{t+d}, Y_t, X_t)
+    h_yd_y = _shannon_entropy(p3.sum(axis=2), base)   # H(Y_{t+d}, Y_t)
+    h_y_x = _shannon_entropy(p3.sum(axis=0), base)    # H(Y_t, X_t)
+    h_y = _shannon_entropy(p3.sum(axis=(0, 2)), base)  # H(Y_t)
+    h_yd_y_x = _shannon_entropy(p3, base)             # H(Y_{t+d}, Y_t, X_t)
+    return float(h_yd_y + h_y_x - h_y - h_yd_y_x)
+
+
+def pte_surrogate_dist(phase_x, phase_y, delay, n_bins_x=None, n_bins_y=None,
+                      kind="circshift", n_surr=200, rng=None, base=2):
+    """Surrogate ``PTE_{X->Y}`` distribution (sender disrupted, receiver intact).
+
+    The *sender* (``phase_x``) is disrupted per trial while the receiver stays
+    intact, so only the directed term ``H(Y_{t+d}|Y_t,X_t)`` is nulled. The mean
+    is the finite-sample bias floor for that direction (effective transfer
+    entropy, Marschinski & Kantz 2002); the spread gives a per-pair null.
+
+    - ``"circshift"`` (default): per-trial circular time-shift of the sender,
+      preserving its autocorrelation/marginal — the conservative effective-TE
+      null.
+    - ``"shuffle"``: per-trial random permutation of the sender timepoints — the
+      Gattas et al. 2023 reference null (destroys sender autocorrelation too).
+
+    Returns an ``(n_surr,)`` array (``nan`` if the window is too short).
+    """
+    phase_x = np.atleast_2d(np.asarray(phase_x, dtype=float))
+    phase_y = np.atleast_2d(np.asarray(phase_y, dtype=float))
+    if rng is None:
+        rng = np.random.default_rng()
+    n_trials, n_win = phase_x.shape
+    if n_win <= int(delay) or int(n_surr) <= 0:
+        return np.full(max(int(n_surr), 1), np.nan)
+    vals = np.empty(int(n_surr), dtype=float)
+    for s in range(int(n_surr)):
+        surr = np.empty_like(phase_x)
+        for k in range(n_trials):
+            if kind == "circshift":
+                surr[k] = np.roll(phase_x[k], int(rng.integers(1, n_win)))
+            elif kind == "shuffle":
+                surr[k] = phase_x[k, rng.permutation(n_win)]
+            else:
+                raise ValueError(f"unknown surrogate kind {kind!r}; use 'circshift' or 'shuffle'")
+        vals[s] = phase_transfer_entropy(surr, phase_y, delay, n_bins_x, n_bins_y, base)
+    return vals
+
+
+def pte_surrogate_mean(phase_x, phase_y, delay, n_bins_x=None, n_bins_y=None,
+                      kind="circshift", n_surr=200, rng=None, base=2):
+    """Mean of :func:`pte_surrogate_dist` — the directional bias floor."""
+    return float(np.nanmean(
+        pte_surrogate_dist(phase_x, phase_y, delay, n_bins_x, n_bins_y,
+                           kind=kind, n_surr=n_surr, rng=rng, base=base)
+    ))
+
+
+def make_seed_target_df(elec_df, epochs, source_roi, target_roi):
     
     """
     Create arrays of indices for mapping electrodes for connectivity analyses. Use the Epoch

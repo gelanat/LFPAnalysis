@@ -552,6 +552,84 @@ def compute_gc_tr(mne_data=None,
     else:
         return np.squeeze(gc_tr)
 
+
+def compute_psi_per_trial(mne_data, indices, band, freqs, n_cycles,
+                          tmin=None, tmax=None, verbose='ERROR'):
+    """Per-trial phase slope index over a band. Returns ``(n_epochs, n_pairs)``.
+
+    ``phase_slope_index`` normally averages over epochs; this keeps the trial axis by slicing
+    each single trial to ``[tmin, tmax)`` (optional), wrapping it as a 1-epoch ``EpochsArray``,
+    running ``phase_slope_index`` (cwt_morlet) on it, and averaging the band/time bins per pair.
+    Positive PSI = seed (``indices[0]``) leads target (``indices[1]``). ``freqs``/``n_cycles`` are
+    the full cwt grid; the band is selected internally via ``fmin``/``fmax`` (matches the
+    epoch-averaged ``compute_connectivity`` PSI path).
+    """
+    X = mne_data.get_data(copy=False)
+    info = mne_data.info
+    times = mne_data.times
+    sfreq = info['sfreq']
+    if (tmin is not None) or (tmax is not None):
+        lo = -np.inf if tmin is None else tmin
+        hi = np.inf if tmax is None else tmax
+        tidx = (times >= lo) & (times < hi)
+    else:
+        tidx = np.ones(times.shape[0], dtype=bool)
+    t0 = times[np.where(tidx)[0][0]]
+    srcs, tgts = indices
+    npair = len(srcs)
+    out = np.full((X.shape[0], npair), np.nan, float)
+    for ei in range(X.shape[0]):
+        ep = mne.EpochsArray(X[ei:ei + 1, :, tidx], info, tmin=t0, verbose=verbose)
+        conn = np.asarray(phase_slope_index(
+            ep, indices=(srcs, tgts), sfreq=sfreq, mode='cwt_morlet',
+            fmin=band[0], fmax=band[1], cwt_freqs=freqs, cwt_n_cycles=n_cycles,
+            verbose=verbose).get_data())
+        axes = [a for a, s in enumerate(conn.shape) if s == npair]
+        if axes and axes[0] != 0:
+            conn = np.moveaxis(conn, axes[0], 0)
+        out[ei, :] = conn.reshape(npair, -1).mean(axis=1)
+    return out
+
+
+def compute_pte_per_trial(mne_data, indices, band, delay=None, n_bins=4,
+                          tmin=None, tmax=None, net=True):
+    """Per-trial phase transfer entropy over a band. Returns ``(n_epochs, n_pairs)``.
+
+    Band-filters (FIR), takes the Hilbert phase, and for each trial computes PTE between each
+    seed→target pair using only that trial's samples. A single trial is short, so a small fixed
+    bin count is used (default 4) rather than Scott's rule. ``net=True`` returns
+    ``PTE_{seed→target} - PTE_{target→seed}`` (positive = seed leads); ``net=False`` returns the
+    raw seed→target PTE. Per-trial PTE is inherently noisy (one short window) — intended for
+    trial-resolved regression with subject-level inference, not single-trial significance.
+    """
+    from scipy.signal import hilbert
+    sfreq = mne_data.info['sfreq']
+    if delay is None:
+        delay = max(1, int(round(0.1 * sfreq)))
+    dat = mne_data.get_data(copy=True)
+    n_ep, n_ch, n_t = dat.shape
+    filt = mne.filter.filter_data(dat.reshape(-1, n_t), sfreq, band[0], band[1], verbose='ERROR')
+    phase = np.angle(hilbert(filt.reshape(n_ep, n_ch, n_t), axis=-1))
+    times = mne_data.times
+    if (tmin is not None) or (tmax is not None):
+        lo = -np.inf if tmin is None else tmin
+        hi = np.inf if tmax is None else tmax
+        phase = phase[:, :, (times >= lo) & (times < hi)]
+    srcs, tgts = indices
+    npair = len(srcs)
+    out = np.full((n_ep, npair), np.nan, float)
+    for p in range(npair):
+        ps, pt = phase[:, srcs[p], :], phase[:, tgts[p], :]
+        for ei in range(n_ep):
+            fwd = phase_transfer_entropy(ps[ei], pt[ei], delay, n_bins_x=n_bins, n_bins_y=n_bins)
+            if net:
+                rev = phase_transfer_entropy(pt[ei], ps[ei], delay, n_bins_x=n_bins, n_bins_y=n_bins)
+                out[ei, p] = fwd - rev
+            else:
+                out[ei, p] = fwd
+    return out
+
+
 def compute_surr_connectivity_epochs(mne_data, indices, metric, band, freqs, n_cycles, gc_n_lags=15, buf_ms=1000):
 
     n_pairs = len(indices[0])

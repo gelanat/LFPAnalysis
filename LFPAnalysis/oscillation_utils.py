@@ -1246,7 +1246,7 @@ def BOSC_detect(b,powthresh,durthresh,Fsample):
     # Step 1: power threshold
     x=b>powthresh
     # we have to turn the boolean to numeric
-    x = np.array(list(map(np.int, x)))
+    x = np.array(list(map(int, x)))
     # show the +1 and -1 edges
     dx=np.diff(x)
     if np.size(np.where(dx==1))!=0:
@@ -1299,8 +1299,148 @@ def BOSC_detect(b,powthresh,durthresh,Fsample):
                 detected[np.arange(H[0][h], H[1][h],1)]=1
         
     # ensure that outputs are integer
-    detected = np.array(list(map(np.int, detected)))
+    detected = np.array(list(map(int, detected)))
     return detected
+
+def _bosc_background(freqs, mean_log_pow, wavenumber=6.0, exclude_peak=None):
+    """Robust log-log 1/f fit of a wavelet power spectrum for BOSC/eBOSC thresholding.
+
+    Parameters
+    ----------
+    freqs : (n_freq,) wavelet center frequencies (Hz).
+    mean_log_pow : (n_freq,) mean over trials & time of log10(wavelet power).
+    wavenumber : Morlet wavenumber (sets the FWHM used for peak exclusion).
+    exclude_peak : None, or (flo, fhi) Hz. When given, the empirical peak in
+        [flo, fhi] and its wavelet FWHM are dropped from the aperiodic fit so a
+        rhythm does not bias its own background (the eBOSC peak-exclusion step).
+
+    Returns
+    -------
+    slope, intercept : robust (Tukey biweight) log-log fit parameters.
+    mp : (n_freq,) linear background power at each frequency (10**fit).
+    """
+    freqs = np.asarray(freqs, float)
+    mean_log_pow = np.asarray(mean_log_pow, float)
+    keep = np.ones(freqs.shape, bool)
+    if exclude_peak is not None:
+        flo, fhi = exclude_peak
+        in_rng = np.where((freqs >= flo) & (freqs <= fhi))[0]
+        if in_rng.size:
+            ipk = in_rng[int(np.argmax(mean_log_pow[in_rng]))]
+            fwhm = (2.0 / wavenumber) * freqs[ipk]
+            keep[(freqs >= freqs[ipk] - fwhm / 2.0) & (freqs <= freqs[ipk] + fwhm / 2.0)] = False
+    if keep.sum() < 2:                              # never fit on <2 points
+        keep = np.ones(freqs.shape, bool)
+    exog = sm.add_constant(np.log10(freqs[keep]))
+    res = sm.RLM(mean_log_pow[keep], exog, M=sm.robust.norms.TukeyBiweight()).fit()
+    intercept, slope = float(res.params[0]), float(res.params[1])
+    mp = 10.0 ** (slope * np.log10(freqs) + intercept)
+    return slope, intercept, mp
+
+
+def _detect_sustained(power, powthresh, durthresh):
+    """Binary detection: power above `powthresh` for runs >= `durthresh` samples.
+
+    Robust run-length implementation (handles runs touching either edge); replaces
+    the edge-case-fragile BOSC_detect on the P-episode path.
+    """
+    above = np.asarray(power, float) > powthresh
+    detected = np.zeros(above.shape[0], dtype=int)
+    if not above.any():
+        return detected
+    edges = np.diff(np.concatenate(([0], above.astype(int), [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    for s, e in zip(starts, ends):
+        if (e - s) >= durthresh:
+            detected[s:e] = 1
+    return detected
+
+
+def pepisode_spectrum(data, sfreq, freqs, wavenumber=6.0, percentile=0.95,
+                      n_cycles=3.0, exclude_peak=None, pad_s=0.0,
+                      times=None, win=None):
+    """BOSC / eBOSC P-episode (rhythmic abundance) spectrum for one channel.
+
+    P-episode at frequency f is the fraction of (trial x time) samples at which a
+    *sustained* rhythm is detected: wavelet power exceeds a chi-square(2) threshold
+    on the robust aperiodic 1/f background AND persists for at least `n_cycles`
+    cycles. This separates a genuine, temporally sustained oscillation from
+    aperiodic 1/f power that merely passes a fixed-band filter -- the question the
+    Preston/Smith/Voytek aperiodic review forces for any "theta" claim.
+
+    The rhythm detection always runs on the WHOLE input timecourse (so episodes
+    spanning the window edge use the surrounding data as buffer, BOSC-style); the
+    abundance is then averaged only over the analysis window (`win`) if given, or
+    over the centre after trimming `pad_s` from each edge, or over everything.
+
+    Parameters
+    ----------
+    data : (n_trials, n_times) or (n_times,) raw signal for one channel (NOT
+        z-scored / baseline-normalised -- BOSC needs raw wavelet power). Pass the
+        full buffered epoch; restrict the readout with `win`.
+    sfreq : sampling frequency (Hz).
+    freqs : center frequencies (Hz). Use a range WIDER than the band of interest
+        (e.g. 2-40) so the 1/f background fit is stable; report the sub-band.
+    wavenumber : Morlet wavenumber (default 6).
+    percentile : background percentile for the power threshold (default 0.95).
+    n_cycles : duration threshold in cycles (default 3).
+    exclude_peak : (flo, fhi) Hz removed from the background fit, or None.
+    pad_s : seconds trimmed from each edge before averaging (used only when `win`
+        is not given).
+    times : (n_times,) time vector (s) matching `data`; required to use `win`.
+    win : (tmin, tmax) seconds -- average abundance only within this window, using
+        the rest of the epoch as wavelet/detection buffer.
+
+    Returns
+    -------
+    dict: freqs, pepisode (per freq), bg_mp (linear background power), pt (power
+        threshold per freq), slope, intercept, n_trials, n_clean_samples,
+        win (the analysis window actually used, or None).
+    """
+    data = np.asarray(data, float)
+    if data.ndim == 1:
+        data = data[None, :]
+    freqs = np.asarray(freqs, float)
+    nfreq = freqs.size
+    ntime = data.shape[1]
+
+    # per-trial wavelet power on the full (buffered) epoch: (n_trial, n_freq, n_time)
+    P = np.empty((data.shape[0], nfreq, ntime))
+    for tr in range(data.shape[0]):
+        B, _, _ = BOSC_tf(data[tr], freqs, sfreq, wavenumber)
+        P[tr] = B
+
+    # robust aperiodic background + chi2(2) power threshold (per freq)
+    mean_log_pow = np.log10(P).mean(axis=(0, 2))
+    slope, intercept, mp = _bosc_background(freqs, mean_log_pow, wavenumber, exclude_peak)
+    pt = chi2.ppf(percentile, 2) * mp / 2.0                # per-freq power threshold
+    dt = n_cycles * sfreq / freqs                          # per-freq duration (samples)
+
+    # samples to COUNT (detection itself always uses the full timecourse as buffer)
+    if win is not None and times is not None:
+        times = np.asarray(times, float)
+        cmask = (times >= win[0]) & (times <= win[1])
+    elif pad_s > 0:
+        pad = int(round(pad_s * sfreq))
+        cmask = np.zeros(ntime, bool)
+        cmask[pad:ntime - pad] = True
+    else:
+        cmask = np.ones(ntime, bool)
+    n_count = int(cmask.sum())
+
+    det_sum = np.zeros(nfreq)
+    for tr in range(P.shape[0]):
+        for fi in range(nfreq):
+            det = _detect_sustained(P[tr, fi, :], pt[fi], dt[fi])
+            det_sum[fi] += det[cmask].sum()
+    pepisode = det_sum / max(P.shape[0] * n_count, 1)
+
+    return {"freqs": freqs, "pepisode": pepisode, "bg_mp": mp, "pt": pt,
+            "slope": slope, "intercept": intercept,
+            "n_trials": int(P.shape[0]), "n_clean_samples": int(P.shape[0] * n_count),
+            "win": win}
+
 
 def eBOSC_getThresholds(cfg_eBOSC, TFR, eBOSC):
     """This function estimates the static duration and power thresholds and

@@ -678,7 +678,669 @@ def FOOOF_compute_epochs(epochs, tmin=0, tmax=1.5, **kwargs):
     return FOOOFGroup_res, pd.concat(all_chan_dfs)
 
 
-# def FOOOF_compare_epochs(epochs_with_metadata, tmin=0, tmax=1.5, conditions=None, band_dict=None, 
+def _eval_aperiodic(freqs, aperiodic_params, aperiodic_mode):
+    """Aperiodic component in log10 power on ``freqs``, from FOOOF aperiodic params.
+
+    ``fixed`` : ``offset - exponent*log10(f)``            params = (offset, exponent)
+    ``knee``  : ``offset - log10(knee + f**exponent)``    params = (offset, knee, exponent)
+
+    Reconstructed analytically (not via FOOOF internals) so the same fixed aperiodic can
+    be subtracted from arbitrary spectra (e.g. per-trial PSDs) on any frequency grid.
+    """
+    f = np.asarray(freqs, dtype=float)
+    p = np.asarray(aperiodic_params, dtype=float)
+    if aperiodic_mode == "knee":
+        offset, knee, exponent = p[0], p[1], p[2]
+        return offset - np.log10(np.clip(knee + f ** exponent, 1e-30, None))
+    offset, exponent = p[0], p[-1]
+    return offset - exponent * np.log10(f)
+
+
+def _interp_notch(log_psd, freqs, notch_freqs, width):
+    """Linearly interpolate log-power across +/- ``width`` Hz of each notch freq.
+
+    Removes line noise while keeping the frequency grid evenly spaced (FOOOF requires
+    equidistant linear freqs, so dropping bins is not an option). Operates on the last
+    axis; rows whose usable points are non-finite are left untouched.
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    bad = np.zeros(freqs.shape, dtype=bool)
+    for nf in notch_freqs:
+        bad |= (freqs >= nf - width) & (freqs <= nf + width)
+    out = np.array(log_psd, dtype=float, copy=True)
+    if not bad.any():
+        return out
+    good = ~bad
+    fg_, fb_ = freqs[good], freqs[bad]
+    flat = out.reshape(-1, freqs.size)
+    for i in range(flat.shape[0]):
+        gi = flat[i, good]
+        if np.isfinite(gi).all():
+            flat[i, bad] = np.interp(fb_, fg_, gi)
+    return flat.reshape(out.shape)
+
+
+def aperiodic_corrected_band_power(
+    epochs,
+    picks,
+    bands,
+    *,
+    tmin=None,
+    tmax=None,
+    fit_range=(2.0, 45.0),
+    aperiodic_mode="knee",
+    peak_width_limits=(1.0, 8.0),
+    max_n_peaks=4,
+    min_peak_height=0.05,
+    peak_threshold=2.0,
+    psd_method="multitaper",
+    psd_kwargs=None,
+    notch_freqs=None,
+    notch_width=2.0,
+    r2_min=0.9,
+    error_max=0.10,
+    per_trial=False,
+    psd=None,
+):
+    """1/f-robust band power via FOOOF/specparam, with fit QC and *visible* attrition.
+
+    The verified scalar band-power estimator for "real oscillation vs 1/f" -- the gold
+    standard for any band-power *claim*. (For time-resolved display use the Morlet
+    baseline-z TFR; for 70-150 Hz HFA use ``representational_utils._broadband_envelope``
+    -- FOOOF would remove the broadband shift that *is* the BHA signal.)
+
+    Per channel: multitaper PSD over ``[tmin, tmax]`` -> FOOOF fit over ``fit_range`` ->
+    aperiodic exponent/offset(/knee) + periodic band power (the aperiodic-corrected,
+    "flattened" spectrum averaged over each band, AND the FOOOF peak power above the fit).
+    Every fit's R^2 and error come back with ``qc_pass`` and ``fit_ok`` flags; bad/failed
+    fits are emitted as rows (NOT silently dropped), so attrition is auditable downstream.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Cleaned, preloaded epochs (or any object exposing ``compute_psd``/``ch_names``).
+    picks : list[str]
+        Channel names to analyse (order preserved; absent names skipped).
+    bands : dict[str, tuple[float, float]]
+        e.g. ``snt_lfp_config.BANDS``. Periodic power is reported per band; a band outside
+        ``fit_range`` is flagged (``band_in_fit_range=False``) and its periodic power is
+        left NaN (extrapolating the low-frequency aperiodic into gamma is not trusted --
+        fit a wide ``fit_range`` with ``notch_freqs=[60, 120]`` to characterise gamma).
+    fit_range : tuple
+        Frequency range FOOOF is fit over (default (2, 45): the standard iEEG low-frequency
+        aperiodic range, below the 60 Hz line).
+    aperiodic_mode : {"knee", "fixed"}
+        iEEG 2-45 Hz often has a knee; report both in audits.
+    notch_freqs, notch_width :
+        Frequencies (Hz) dropped (+/- ``notch_width``) before fitting -- line noise when
+        ``fit_range`` spans 60/120 Hz.
+    r2_min, error_max : float
+        ``qc_pass = fit_ok & (r_squared >= r2_min) & (fit_error <= error_max)``.
+    per_trial : bool
+        If True, also emit per (channel, band, trial) rows with the per-trial periodic band
+        power, computed by holding the channel's (robustly trial-averaged) aperiodic fit
+        FIXED and subtracting it from each trial's PSD -- stable, avoids fitting FOOOF to
+        noisy single-trial spectra. Channel-level QC/aperiodic columns are broadcast on.
+    psd : tuple(np.ndarray, np.ndarray), optional
+        Precomputed ``(psds, freqs)``, ``psds`` shape ``(n_trials, n_picks, n_freq)`` in the
+        same pick order -- bypasses ``epochs.compute_psd`` (used by the smoke test).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per (channel, band) summary (``trial == -1``); plus, if ``per_trial``, per
+        (channel, band, trial) rows (``trial >= 0``). Columns include: channel, band,
+        band_lo, band_hi, trial, raw_band_power (log10 PSD mean over band),
+        periodic_band_power (aperiodic-corrected, log10), aperiodic_fraction (linear, 0..1),
+        peak_cf/peak_pw/peak_bw, aperiodic_offset/aperiodic_knee/aperiodic_exponent,
+        r_squared, fit_error, n_peaks, fit_ok, qc_pass, band_in_fit_range, n_trials,
+        aperiodic_mode, fit_lo, fit_hi.
+    """
+    from fooof import FOOOFGroup
+    from fooof.analysis import get_band_peak_fm
+
+    psd_kwargs = dict(psd_kwargs or {})
+    if hasattr(epochs, "ch_names"):
+        picks = [c for c in picks if c in epochs.ch_names]
+    else:
+        picks = list(picks)
+    if not picks:
+        return pd.DataFrame()
+
+    band_lo = min(v[0] for v in bands.values())
+    band_hi = max(v[1] for v in bands.values())
+    psd_fmin = min(fit_range[0], band_lo)
+    psd_fmax = max(fit_range[1], band_hi)
+    if psd is not None:
+        psds, freqs = psd
+        psds = np.asarray(psds, dtype=float)
+    else:
+        spec = epochs.compute_psd(method=psd_method, tmin=tmin, tmax=tmax,
+                                  fmin=psd_fmin, fmax=psd_fmax, picks=picks,
+                                  verbose="ERROR", **psd_kwargs)
+        psds, freqs = spec.get_data(return_freqs=True)   # (n_trials, n_picks, n_freq)
+    freqs = np.asarray(freqs, dtype=float)
+    psds = np.clip(psds, 1e-20, None)
+    log_psds = np.log10(psds)
+    n_trials = psds.shape[0]
+
+    # Line-noise handling: interpolate log-power across +/- notch_width of each notch freq
+    # (dropping bins would break FOOOF's even-spacing requirement; interpolation keeps the
+    # grid linear and removes line noise from both the fit and the band-power estimate).
+    if notch_freqs:
+        log_psds = _interp_notch(log_psds, freqs, notch_freqs, notch_width)
+        psds = 10.0 ** log_psds
+    psd_avg = np.nanmean(psds, axis=0)                   # (n_picks, n_freq) -- robust fit target
+
+    fit_mask = (freqs >= fit_range[0]) & (freqs <= fit_range[1])
+    fit_freqs = freqs[fit_mask]
+
+    # Fit only channels with a fully finite spectrum over the fit band, so one bad channel
+    # cannot poison the group fit (FOOOF raises on NaN input); the rest are emitted as
+    # fit_ok=False rows -> attrition stays visible and per-channel.
+    fit_idx = [ci for ci in range(len(picks)) if np.isfinite(psd_avg[ci, fit_mask]).all()]
+    fitted = {}
+    if fit_idx:
+        fg = FOOOFGroup(peak_width_limits=list(peak_width_limits), max_n_peaks=max_n_peaks,
+                        min_peak_height=min_peak_height, peak_threshold=peak_threshold,
+                        aperiodic_mode=aperiodic_mode, verbose=False)
+        try:
+            fg.fit(fit_freqs, psd_avg[np.asarray(fit_idx)][:, fit_mask], fit_range)
+            for k, ci in enumerate(fit_idx):
+                fitted[ci] = fg.get_fooof(ind=k, regenerate=True)
+        except Exception:
+            fitted = {}
+
+    rows = []
+    for ci, ch in enumerate(picks):
+        fm, r2, err, ap_params, n_pk = fitted.get(ci), np.nan, np.nan, None, 0
+        if fm is not None:
+            try:
+                r2 = float(fm.get_params("r_squared"))
+                err = float(fm.get_params("error"))
+                ap_params = np.asarray(fm.aperiodic_params_, dtype=float)
+                n_pk = int(fm.n_peaks_)
+            except Exception:
+                fm = None
+
+        fit_ok = (fm is not None and np.isfinite(r2) and ap_params is not None
+                  and np.all(np.isfinite(ap_params)))
+        qc_pass = bool(fit_ok and (r2 >= r2_min) and (err <= error_max))
+
+        if fit_ok and aperiodic_mode == "knee":
+            ap_offset, ap_knee, ap_exp = ap_params[0], ap_params[1], ap_params[2]
+        elif fit_ok:
+            ap_offset, ap_knee, ap_exp = ap_params[0], np.nan, ap_params[-1]
+        else:
+            ap_offset = ap_knee = ap_exp = np.nan
+
+        ap_log_full = (_eval_aperiodic(freqs, ap_params, aperiodic_mode)
+                       if fit_ok else np.full_like(freqs, np.nan))
+
+        for bname, (lo, hi) in bands.items():
+            bmask = (freqs >= lo) & (freqs <= hi)
+            if not bmask.any():
+                continue
+            in_fit = bool((lo >= fit_range[0]) and (hi <= fit_range[1]))
+            raw_bp = float(np.log10(psd_avg[ci, bmask]).mean())
+            if fit_ok and in_fit:
+                flat = np.log10(psd_avg[ci, bmask]) - ap_log_full[bmask]
+                periodic_bp = float(flat.mean())
+                ap_lin = 10.0 ** ap_log_full[bmask]
+                frac_ap = float(np.clip(ap_lin.mean() / max(psd_avg[ci, bmask].mean(), 1e-30), 0.0, 1.0))
+                pk = np.atleast_1d(np.asarray(get_band_peak_fm(fm, (lo, hi), select_highest=True),
+                                              dtype=float))
+                peak_cf, peak_pw, peak_bw = (pk[0], pk[1], pk[2]) if pk.size >= 3 else (np.nan, np.nan, np.nan)
+            else:
+                periodic_bp = frac_ap = peak_cf = peak_pw = peak_bw = np.nan
+
+            base = {
+                "channel": ch, "band": bname, "band_lo": lo, "band_hi": hi,
+                "aperiodic_offset": ap_offset, "aperiodic_knee": ap_knee,
+                "aperiodic_exponent": ap_exp, "r_squared": r2, "fit_error": err,
+                "n_peaks": n_pk, "fit_ok": fit_ok, "qc_pass": qc_pass,
+                "peak_cf": peak_cf, "peak_pw": peak_pw, "peak_bw": peak_bw,
+                "aperiodic_fraction": frac_ap, "band_in_fit_range": in_fit,
+                "n_trials": n_trials, "aperiodic_mode": aperiodic_mode,
+                "fit_lo": fit_range[0], "fit_hi": fit_range[1],
+            }
+            rows.append({**base, "trial": -1, "raw_band_power": raw_bp,
+                         "periodic_band_power": periodic_bp})
+
+            if per_trial and fit_ok and in_fit:
+                flat_t = log_psds[:, ci, bmask] - ap_log_full[None, bmask]   # (n_trials, n_band)
+                periodic_t = flat_t.mean(axis=1)
+                raw_t = log_psds[:, ci, bmask].mean(axis=1)
+                for ti in range(n_trials):
+                    rows.append({**base, "trial": ti, "raw_band_power": float(raw_t[ti]),
+                                 "periodic_band_power": float(periodic_t[ti])})
+
+    return pd.DataFrame(rows)
+
+
+def per_trial_fooof_band_power(
+    epochs,
+    picks,
+    bands,
+    *,
+    tmin=None,
+    tmax=None,
+    fit_range=(2.0, 45.0),
+    aperiodic_mode="fixed",
+    peak_width_limits=(1.0, 8.0),
+    max_n_peaks=4,
+    min_peak_height=0.05,
+    peak_threshold=2.0,
+    psd_method="multitaper",
+    psd_kwargs=None,
+    notch_freqs=None,
+    notch_width=2.0,
+    r2_min=0.8,
+    error_max=0.15,
+    psd=None,
+):
+    """Per-TRIAL FOOOF — fit each trial's PSD separately for *trial-varying* aperiodic params.
+
+    Use when the APERIODIC component is itself the trial-resolved quantity of interest
+    (aperiodic exponent/offset ~ behaviour). For a stable trial-resolved OSCILLATORY power
+    estimate prefer :func:`aperiodic_corrected_band_power` with ``per_trial=True`` (which holds a
+    robust channel aperiodic FIXED — single-trial aperiodic fits are noisy). QC thresholds are
+    looser here (single-trial spectra) and reported per trial; failed fits are emitted, not dropped.
+    ``aperiodic_mode="fixed"`` by default (per-trial knee fits are unstable).
+
+    Returns one row per (channel, trial, band): channel, trial, band, band_lo, band_hi,
+    raw_band_power, periodic_band_power, aperiodic_exponent, aperiodic_offset, aperiodic_knee,
+    r_squared, fit_error, fit_ok, qc_pass, band_in_fit_range, aperiodic_mode.
+    """
+    from fooof import FOOOFGroup
+
+    psd_kwargs = dict(psd_kwargs or {})
+    if hasattr(epochs, "ch_names"):
+        picks = [c for c in picks if c in epochs.ch_names]
+    else:
+        picks = list(picks)
+    if not picks:
+        return pd.DataFrame()
+
+    band_lo = min(v[0] for v in bands.values())
+    band_hi = max(v[1] for v in bands.values())
+    psd_fmin = min(fit_range[0], band_lo)
+    psd_fmax = max(fit_range[1], band_hi)
+    if psd is not None:
+        psds, freqs = psd
+        psds = np.asarray(psds, dtype=float)
+    else:
+        spec = epochs.compute_psd(method=psd_method, tmin=tmin, tmax=tmax,
+                                  fmin=psd_fmin, fmax=psd_fmax, picks=picks,
+                                  verbose="ERROR", **psd_kwargs)
+        psds, freqs = spec.get_data(return_freqs=True)
+    freqs = np.asarray(freqs, dtype=float)
+    psds = np.clip(psds, 1e-20, None)
+    if notch_freqs:
+        log_psds = _interp_notch(np.log10(psds), freqs, notch_freqs, notch_width)
+        psds = 10.0 ** log_psds
+    else:
+        log_psds = np.log10(psds)
+    n_trials = psds.shape[0]
+
+    fit_mask = (freqs >= fit_range[0]) & (freqs <= fit_range[1])
+    fit_freqs = freqs[fit_mask]
+
+    rows = []
+    for ci, ch in enumerate(picks):
+        spectra = psds[:, ci, fit_mask]                    # (n_trials, n_fit_freq) — trials = group dim
+        ok = np.isfinite(spectra).all(axis=1)
+        r2 = np.full(n_trials, np.nan)
+        err = np.full(n_trials, np.nan)
+        aps = [None] * n_trials
+        if ok.any():
+            fg = FOOOFGroup(peak_width_limits=list(peak_width_limits), max_n_peaks=max_n_peaks,
+                            min_peak_height=min_peak_height, peak_threshold=peak_threshold,
+                            aperiodic_mode=aperiodic_mode, verbose=False)
+            try:
+                fg.fit(fit_freqs, spectra[ok], fit_range)
+                r2_ok = np.atleast_1d(fg.get_params("r_squared"))
+                err_ok = np.atleast_1d(fg.get_params("error"))
+                ap_ok = np.atleast_2d(fg.get_params("aperiodic_params"))
+                for k, ti in enumerate(np.where(ok)[0]):
+                    r2[ti], err[ti], aps[ti] = r2_ok[k], err_ok[k], ap_ok[k]
+            except Exception:
+                pass
+        for ti in range(n_trials):
+            ap_params = aps[ti]
+            fit_ok = ap_params is not None and np.isfinite(r2[ti]) and np.all(np.isfinite(ap_params))
+            qc_pass = bool(fit_ok and r2[ti] >= r2_min and err[ti] <= error_max)
+            if fit_ok and aperiodic_mode == "knee":
+                offs, knee, expo = ap_params[0], ap_params[1], ap_params[2]
+            elif fit_ok:
+                offs, knee, expo = ap_params[0], np.nan, ap_params[-1]
+            else:
+                offs = knee = expo = np.nan
+            ap_log = _eval_aperiodic(freqs, ap_params, aperiodic_mode) if fit_ok else None
+            for bname, (lo, hi) in bands.items():
+                bmask = (freqs >= lo) & (freqs <= hi)
+                if not bmask.any():
+                    continue
+                in_fit = bool(lo >= fit_range[0] and hi <= fit_range[1])
+                raw_bp = float(log_psds[ti, ci, bmask].mean())
+                periodic_bp = (float((log_psds[ti, ci, bmask] - ap_log[bmask]).mean())
+                               if (fit_ok and in_fit) else np.nan)
+                rows.append({
+                    "channel": ch, "trial": ti, "band": bname, "band_lo": lo, "band_hi": hi,
+                    "raw_band_power": raw_bp, "periodic_band_power": periodic_bp,
+                    "aperiodic_exponent": expo, "aperiodic_offset": offs, "aperiodic_knee": knee,
+                    "r_squared": r2[ti], "fit_error": err[ti], "fit_ok": fit_ok,
+                    "qc_pass": qc_pass, "band_in_fit_range": in_fit, "aperiodic_mode": aperiodic_mode,
+                })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Subject-specific (individualized) theta band + aperiodic intrinsic timescale
+# ---------------------------------------------------------------------------
+# Grounding: Preston, Smith & Voytek 2026 (Nat Hum Behav) — band power != oscillation
+# (Fourier fallacy), so only treat a band as oscillatory where a real peak sits above
+# the 1/f; and shared aperiodic *timescale* (autocorrelation) can inflate inter-regional
+# coupling between independent signals ("communication through aperiodic dynamics") — so
+# the timescale is both a candidate communication channel AND a confound to partial out.
+
+
+def individualized_band(theta_cf, *, rule="cf_pm_2", half_width=2.0,
+                        min_lo=2.0, max_hi=12.0, default=(2.0, 8.0)):
+    """Band ``(lo, hi)`` around a detected peak centre-frequency.
+
+    ``rule="cf_pm_2"`` -> ``cf +/- 2`` Hz (primary); ``rule="cf_pm_halfbw"`` ->
+    ``cf +/- half_width`` (pass the FOOOF peak half-bandwidth). Clamped to
+    ``[min_lo, max_hi]`` with a >=1 Hz width guard. Returns ``default`` when ``cf`` is
+    not finite (the no-peak fallback).
+    """
+    if theta_cf is None or not np.isfinite(theta_cf):
+        return (float(default[0]), float(default[1]))
+    if rule == "cf_pm_halfbw" and np.isfinite(half_width) and half_width > 0:
+        w = float(half_width)
+    else:
+        w = 2.0
+    lo = max(float(min_lo), float(theta_cf) - w)
+    hi = min(float(max_hi), float(theta_cf) + w)
+    if hi - lo < 1.0:                          # degenerate-width guard
+        lo = max(float(min_lo), float(theta_cf) - 1.0)
+        hi = min(float(max_hi), float(theta_cf) + 1.0)
+    return (float(lo), float(hi))
+
+
+def detect_region_peak_band(epochs, picks, reg_of, regions, *, tmin=None, tmax=None,
+                            fit_range=(2.0, 45.0), aperiodic_mode="knee",
+                            search_band=(2.0, 12.0), bandwidth_rule="cf_pm_2",
+                            min_peak_pw=0.15, min_with_peak=2, default_band=(2.0, 8.0),
+                            psd=None, **fooof_kwargs):
+    """Per-(subject x region) individualized theta band from FOOOF peak centre-frequencies.
+
+    Fits FOOOF (knee) per channel over ``search_band`` (reusing
+    :func:`aperiodic_corrected_band_power`), then per region takes ``theta_cf`` = median
+    ``peak_cf`` over QC channels that HAVE a detectable peak, and builds the band via
+    :func:`individualized_band`. Regions with fewer than ``min_with_peak`` detected peaks
+    fall back to ``default_band`` (``fallback_used=True``). ALL channels are kept (peak
+    presence affects only the cf estimate, not downstream channel inclusion).
+
+    Returns one row per region: ``region, theta_cf, n_chan, n_with_peak, peak_frac,
+    band_lo, band_hi, fallback_used`` plus region-median ``aperiodic_knee/exponent/offset``
+    and ``r_squared`` over QC channels (for the timescale arm and QC).
+    """
+    if hasattr(epochs, "ch_names"):
+        picks = [c for c in picks if c in epochs.ch_names]
+    else:
+        picks = list(picks)
+
+    def _fallback_table():
+        return pd.DataFrame([{
+            "region": r, "theta_cf": np.nan, "n_chan": 0, "n_with_peak": 0,
+            "peak_frac": np.nan, "band_lo": float(default_band[0]),
+            "band_hi": float(default_band[1]), "fallback_used": True,
+            "aperiodic_knee": np.nan, "aperiodic_exponent": np.nan,
+            "aperiodic_offset": np.nan, "r_squared": np.nan} for r in regions])
+
+    if not picks:
+        return _fallback_table()
+
+    cbp = aperiodic_corrected_band_power(
+        epochs, picks, {"theta_search": (float(search_band[0]), float(search_band[1]))},
+        tmin=tmin, tmax=tmax, fit_range=fit_range, aperiodic_mode=aperiodic_mode,
+        psd=psd, **fooof_kwargs)
+    if cbp.empty:
+        return _fallback_table()
+
+    ch = cbp[cbp.trial == -1].drop_duplicates("channel").copy()
+    ch["region"] = ch["channel"].map(reg_of)
+
+    rows = []
+    for region in regions:
+        g = ch[ch.region == region]
+        n_chan = int(len(g))
+        with_peak = g[g.qc_pass & g.peak_cf.notna()
+                      & (g.peak_pw.fillna(-np.inf) >= min_peak_pw)]
+        n_with = int(len(with_peak))
+        peak_frac = (n_with / n_chan) if n_chan else np.nan
+        qc = g[g.qc_pass]
+        ap_knee = float(qc.aperiodic_knee.median()) if len(qc) else np.nan
+        ap_exp = float(qc.aperiodic_exponent.median()) if len(qc) else np.nan
+        ap_off = float(qc.aperiodic_offset.median()) if len(qc) else np.nan
+        r2 = float(qc.r_squared.median()) if len(qc) else np.nan
+        if n_with >= min_with_peak:
+            cf = float(with_peak.peak_cf.median())
+            half_bw = (float(with_peak.peak_bw.median())
+                       if bandwidth_rule == "cf_pm_halfbw" else 2.0)
+            lo, hi = individualized_band(cf, rule=bandwidth_rule, half_width=half_bw,
+                                         min_lo=search_band[0], max_hi=search_band[1],
+                                         default=default_band)
+            fb = False
+        else:
+            cf, (lo, hi), fb = np.nan, (float(default_band[0]), float(default_band[1])), True
+        rows.append({"region": region, "theta_cf": cf, "n_chan": n_chan,
+                     "n_with_peak": n_with, "peak_frac": peak_frac,
+                     "band_lo": lo, "band_hi": hi, "fallback_used": fb,
+                     "aperiodic_knee": ap_knee, "aperiodic_exponent": ap_exp,
+                     "aperiodic_offset": ap_off, "r_squared": r2})
+    return pd.DataFrame(rows)
+
+
+def pair_band(band_src, band_tgt, *, src_has_peak=True, tgt_has_peak=True,
+              mode="union", directed=False, default=(2.0, 8.0)):
+    """Connectivity band for a region pair from the two regions' individualized bands.
+
+    ``band_src``/``band_tgt`` are ``(lo, hi)`` tuples. Directed metrics (PTE/GPDC/TRGC,
+    signed PSI) use the SOURCE band (the sender defines the rhythm whose lead we test).
+    Undirected metrics use ``mode``: ``"union"`` = span both ``(min lo, max hi)``
+    [primary]; ``"mean"`` = band around the mean centre with the mean half-width.
+
+    Fallback ladder on peak presence: both present -> rule above; one missing -> the
+    present region's band for both; neither -> ``default``. Returns ``(lo, hi, rule)``.
+    """
+    s = (float(band_src[0]), float(band_src[1])) if band_src is not None else None
+    t = (float(band_tgt[0]), float(band_tgt[1])) if band_tgt is not None else None
+    if (not src_has_peak and not tgt_has_peak) or s is None or t is None:
+        if s is not None and (src_has_peak or t is None):
+            return (s[0], s[1], "src_only")
+        if t is not None and tgt_has_peak:
+            return (t[0], t[1], "tgt_only")
+        return (float(default[0]), float(default[1]), "fallback_default")
+    if directed:
+        if src_has_peak:
+            return (s[0], s[1], "src_peak")
+        return (t[0], t[1], "tgt_peak_fallback")
+    if not src_has_peak:
+        return (t[0], t[1], "tgt_only")
+    if not tgt_has_peak:
+        return (s[0], s[1], "src_only")
+    if mode == "mean":
+        cs, ct = (s[0] + s[1]) / 2.0, (t[0] + t[1]) / 2.0
+        ws, wt = (s[1] - s[0]) / 2.0, (t[1] - t[0]) / 2.0
+        c, w = (cs + ct) / 2.0, (ws + wt) / 2.0
+        return (c - w, c + w, "mean")
+    return (min(s[0], t[0]), max(s[1], t[1]), "union")
+
+
+def knee_to_timescale_ms(knee, exponent):
+    """Aperiodic knee + exponent -> intrinsic timescale (ms).
+
+    ``tau = 1000 / (2*pi*f_knee)`` with knee frequency ``f_knee = knee**(1/exponent)``
+    (the FOOOF knee parameter is in units of ``f**exponent``; Gao et al. 2020, eLife).
+    Returns NaN for invalid params (non-finite, ``knee<=0`` or ``exponent<=0``).
+    """
+    try:
+        knee = float(knee)
+        exponent = float(exponent)
+    except (TypeError, ValueError):
+        return np.nan
+    if not (np.isfinite(knee) and np.isfinite(exponent)) or knee <= 0 or exponent <= 0:
+        return np.nan
+    f_knee = knee ** (1.0 / exponent)
+    if not np.isfinite(f_knee) or f_knee <= 0:
+        return np.nan
+    return float(1000.0 / (2.0 * np.pi * f_knee))
+
+
+def _interp_cross(xs, ys, idx, thr):
+    """Linear-interpolated x at which ``ys`` crosses ``thr`` between ``idx-1`` and ``idx``."""
+    if idx <= 0:
+        return float(xs[0])
+    x0, x1, y0, y1 = xs[idx - 1], xs[idx], ys[idx - 1], ys[idx]
+    if y1 == y0:
+        return float(x1)
+    return float(x0 + (thr - y0) * (x1 - x0) / (y1 - y0))
+
+
+def intrinsic_timescale_acw(signal, sfreq, *, kind="acwe", band=None,
+                            max_lag_ms=500.0, detrend=True):
+    """Model-free intrinsic timescale (ms) from the autocorrelation function (ACF).
+
+    ``kind="acw0"`` = first zero-crossing lag of the ACF (the autocorrelation window);
+    ``kind="acwe"`` = first ``1/e`` crossing (= the decay time-constant for an
+    exponential ACF, e.g. AR(1)). Optionally band-limit (order-4 Butterworth) before the
+    ACF. Dependency-light: biased ACF via FFT, sub-sample crossing by linear interp.
+    Returns NaN for degenerate input; censors at ``max_lag_ms`` if no crossing.
+    """
+    x = np.asarray(signal, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 16:
+        return np.nan
+    if band is not None:
+        from scipy.signal import butter, sosfiltfilt
+        sos = butter(4, [float(band[0]), float(band[1])], btype="bandpass",
+                     fs=float(sfreq), output="sos")
+        x = sosfiltfilt(sos, x)
+    if detrend:
+        x = x - x.mean()
+    sd = x.std()
+    if not np.isfinite(sd) or sd == 0:
+        return np.nan
+    n = x.size
+    nfft = 1 << int(np.ceil(np.log2(2 * n - 1)))
+    f = np.fft.rfft(x, nfft)
+    acf = np.fft.irfft(f * np.conj(f), nfft)[:n]
+    if acf[0] <= 0:
+        return np.nan
+    acf = acf / acf[0]
+    max_lag = int(min(n - 1, round(max_lag_ms * float(sfreq) / 1000.0)))
+    if max_lag < 2:
+        return np.nan
+    a = acf[:max_lag + 1]
+    lags_ms = np.arange(max_lag + 1) / float(sfreq) * 1000.0
+    thr = 0.0 if kind == "acw0" else (1.0 / np.e if kind == "acwe" else None)
+    if thr is None:
+        raise ValueError(f"unknown kind {kind!r} (use 'acw0' or 'acwe')")
+    below = np.where(a <= thr)[0]
+    if below.size == 0:
+        return float(lags_ms[-1])
+    return _interp_cross(lags_ms, a, int(below[0]), thr)
+
+
+def per_trial_timescale(epochs, picks, *, tmin=None, tmax=None, acw_band=None,
+                        acw_kind="acwe", max_lag_ms=500.0, knee_tau=False,
+                        fit_range=(2.0, 45.0), psd=None, **fooof_kwargs):
+    """Per-(channel, trial) intrinsic timescale (ms).
+
+    ``tau_acw_ms`` (always) via :func:`intrinsic_timescale_acw` on each trial's time-domain
+    signal (single-trial-valid). If ``knee_tau=True`` also fit per-trial FOOOF (knee) and
+    add ``tau_knee_ms`` via :func:`knee_to_timescale_ms` (noisier; see
+    :func:`per_trial_fooof_band_power`). Returns a tidy DataFrame.
+    """
+    if hasattr(epochs, "ch_names"):
+        picks = [c for c in picks if c in epochs.ch_names]
+    else:
+        picks = list(picks)
+    if not picks:
+        return pd.DataFrame()
+    sfreq = float(epochs.info["sfreq"])
+    data = epochs.copy().pick(picks)
+    if tmin is not None or tmax is not None:
+        lo = tmin if tmin is not None else data.tmin
+        hi = tmax if tmax is not None else data.tmax
+        data = data.crop(tmin=lo, tmax=hi)
+    arr = data.get_data(copy=False)                       # (n_trials, n_ch, n_times)
+    n_tr, n_ch = arr.shape[0], arr.shape[1]
+
+    knee_lookup = None
+    if knee_tau:
+        kdf = per_trial_fooof_band_power(
+            epochs, picks, {"theta": (2.0, 8.0)}, tmin=tmin, tmax=tmax,
+            fit_range=fit_range, aperiodic_mode="knee", psd=psd, **fooof_kwargs)
+        if not kdf.empty:
+            knee_lookup = (kdf.drop_duplicates(["channel", "trial"])
+                              .set_index(["channel", "trial"]))
+
+    rows = []
+    for ci, ch in enumerate(picks):
+        for ti in range(n_tr):
+            tau_acw = intrinsic_timescale_acw(arr[ti, ci], sfreq, kind=acw_kind,
+                                              band=acw_band, max_lag_ms=max_lag_ms)
+            rec = {"channel": ch, "trial": ti, "tau_acw_ms": tau_acw, "acw_kind": acw_kind}
+            if knee_lookup is not None:
+                try:
+                    r = knee_lookup.loc[(ch, ti)]
+                    rec.update({
+                        "tau_knee_ms": knee_to_timescale_ms(r["aperiodic_knee"],
+                                                            r["aperiodic_exponent"]),
+                        "aperiodic_knee": float(r["aperiodic_knee"]),
+                        "aperiodic_exponent": float(r["aperiodic_exponent"]),
+                        "knee_qc_pass": bool(r["qc_pass"])})
+                except KeyError:
+                    rec["tau_knee_ms"] = np.nan
+            rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def aperiodic_timescale(epochs, picks, *, tmin=None, tmax=None, fit_range=(2.0, 45.0),
+                        acw_band=None, acw_kind="acwe", max_lag_ms=500.0, psd=None,
+                        **fooof_kwargs):
+    """Per-channel intrinsic timescale (ms), two ways, for the aperiodic-coupling arm.
+
+    ``tau_knee_ms`` from the trial-averaged FOOOF knee fit (reuses
+    :func:`aperiodic_corrected_band_power` with ``aperiodic_mode="knee"``); ``tau_acw_ms``
+    = median over trials of the model-free ACF crossing. One row per channel with the
+    aperiodic params and QC.
+    """
+    cbp = aperiodic_corrected_band_power(
+        epochs, picks, {"theta": (2.0, 8.0)}, tmin=tmin, tmax=tmax,
+        fit_range=fit_range, aperiodic_mode="knee", psd=psd, **fooof_kwargs)
+    if cbp.empty:
+        return pd.DataFrame()
+    summ = cbp[cbp.trial == -1].drop_duplicates("channel").set_index("channel")
+    ptt = per_trial_timescale(epochs, picks, tmin=tmin, tmax=tmax, acw_band=acw_band,
+                              acw_kind=acw_kind, max_lag_ms=max_lag_ms)
+    acw_med = (ptt.groupby("channel")["tau_acw_ms"].median()
+               if not ptt.empty else pd.Series(dtype=float))
+    rows = []
+    for ch in summ.index:
+        knee, expo = summ.loc[ch, "aperiodic_knee"], summ.loc[ch, "aperiodic_exponent"]
+        rows.append({"channel": ch, "tau_knee_ms": knee_to_timescale_ms(knee, expo),
+                     "tau_acw_ms": float(acw_med.get(ch, np.nan)),
+                     "aperiodic_knee": float(knee), "aperiodic_exponent": float(expo),
+                     "r_squared": float(summ.loc[ch, "r_squared"]),
+                     "qc_pass": bool(summ.loc[ch, "qc_pass"])})
+    return pd.DataFrame(rows)
+
+
+# def FOOOF_compare_epochs(epochs_with_metadata, tmin=0, tmax=1.5, conditions=None, band_dict=None,
 # file_path=None, plot=True, **kwargs):
 #     """
 #     Function for comparing conditions.

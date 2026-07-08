@@ -503,6 +503,131 @@ def feature_matrix_timeresolved(
 
 
 # --------------------------------------------------------------------------- #
+# Event-locked features (per-trial onset). The sliding-window reducers above use
+# window centers fixed relative to the epoch's t=0. When the event of interest
+# occurs at a DIFFERENT, per-trial time (e.g. options/stimulus onset at t=-RT in a
+# response-locked epoch), each trial must be reduced in windows centered on ITS OWN
+# onset. The envelope is still computed once (label-blind), only the reduction is
+# per-trial. Windows that fall outside the epoch are NaN (the decoder drops them).
+# --------------------------------------------------------------------------- #
+def per_trial_band_power_event_locked(
+    epochs,
+    picks: list[str],
+    band: tuple[float, float],
+    onset_s,
+    offsets,
+    *,
+    window_s: float = 0.5,
+    kind: str = "power",
+    filter_kind: str = "butter",
+    order: int = 4,
+    log: bool = True,
+    n_subbands: int = 1,
+    subband_norm: str = "zscore",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-channel, per-trial band power in windows locked to a PER-TRIAL event onset.
+
+    The event-locked analogue of :func:`per_trial_band_power_timeresolved`. The analytic
+    envelope is computed ONCE over the whole epoch (same substrate as the timeresolved
+    reducer -- normalized-broadband if ``n_subbands > 1``, single band otherwise), then
+    reduced in a sliding window centered on ``onset_s[trial] + offset`` for every offset.
+    This re-locks a response-locked epoch to a per-trial stimulus onset (pass
+    ``onset_s = -reaction_time``) without re-epoching the raw data.
+
+    Parameters
+    ----------
+    onset_s : array-like, shape (n_trials,)
+        Per-trial event time in seconds relative to the epoch's t=0 (the lock target).
+        Non-finite entries yield an all-NaN trial.
+    offsets : array-like, shape (n_offsets,)
+        Window-center offsets (s) relative to each trial's onset (e.g. ``0 .. +2`` s
+        after stimulus onset).
+    window_s : float
+        Reduction-window width (s), centered on ``onset + offset``.
+
+    Returns
+    -------
+    X_t : np.ndarray
+        ``(n_trials, len(picks), len(offsets))``. NaN wherever the window falls outside
+        the epoch (partial-window trials are not silently truncated).
+    offsets : np.ndarray
+        ``(n_offsets,)`` echoed offsets (the event-locked time axis).
+    """
+    if n_subbands > 1:
+        env, times, picks = _broadband_envelope(
+            epochs, picks, band, n_subbands=n_subbands, kind=kind,
+            subband_norm=subband_norm, filter_kind=filter_kind, order=order,
+        )
+        log = False  # per-sub-band normalization already stabilizes; z-score can be < 0
+    else:
+        env, times, picks = _band_envelope(
+            epochs, picks, band, kind=kind, filter_kind=filter_kind, order=order
+        )
+    offsets = np.asarray(offsets, dtype=float)
+    onset = np.asarray(onset_s, dtype=float)
+    n_tr = len(epochs)
+    if not picks or offsets.size == 0:
+        return np.empty((n_tr, len(picks), offsets.size), dtype=float), offsets
+    if onset.shape != (n_tr,):
+        raise ValueError(f"onset_s must have shape ({n_tr},), got {onset.shape}")
+
+    half = window_s / 2.0
+    t0, t1 = float(times[0]), float(times[-1])
+    X_t = np.full((n_tr, len(picks), offsets.size), np.nan, dtype=float)
+    for j, off in enumerate(offsets):
+        centers = onset + off  # (n_trials,)
+        for i in range(n_tr):
+            c = centers[i]
+            if not np.isfinite(c) or (c - half) < t0 or (c + half) > t1:
+                continue  # window outside the epoch -> leave NaN
+            m = (times >= c - half) & (times <= c + half)
+            if m.any():
+                X_t[i, :, j] = env[i][:, m].mean(axis=1)  # (n_pick, n_win) -> (n_pick,)
+    if log:
+        X_t = np.log10(X_t + np.finfo(float).tiny)
+    return X_t, offsets
+
+
+def feature_matrix_event_locked(
+    epochs,
+    elec_df,
+    roi: str,
+    band: tuple[float, float],
+    onset_s,
+    offsets,
+    *,
+    window_s: float = 0.5,
+    hemi: str | None = None,
+    kind: str = "power",
+    region_col: str = "SNT_region",
+    **power_kw,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Event-locked (per-trial onset) per-trial feature tensor for one region (single band).
+
+    The per-trial-onset analogue of :func:`feature_matrix_timeresolved`; decode each offset
+    by slicing ``X[:, :, j]`` -> ``(n_trials, n_channels)``.
+
+    Returns
+    -------
+    X : np.ndarray
+        ``(n_trials, n_channels, n_offsets)``; NaN where a window leaves the epoch.
+    offsets : np.ndarray
+        ``(n_offsets,)`` event-locked time axis.
+    picks : list[str]
+        The channels used.
+    """
+    picks = picks_in_region(
+        elec_df, roi, region_col=region_col, hemi=hemi, ch_names=epochs.ch_names
+    )
+    if not picks:
+        return (np.empty((len(epochs), 0, 0), dtype=float), np.asarray(offsets, float), [])
+    X, offs = per_trial_band_power_event_locked(
+        epochs, picks, band, onset_s, offsets, window_s=window_s, kind=kind, **power_kw,
+    )
+    return X, offs, picks
+
+
+# --------------------------------------------------------------------------- #
 # Theta-phase-binned HFA features (Lisman/Jensen theta-gamma code). HFA power
 # (amplitude) binned by concurrent theta PHASE -- HFA is broadband, never phase.
 # --------------------------------------------------------------------------- #

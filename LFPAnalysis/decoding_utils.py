@@ -68,6 +68,24 @@ def infer_task(y) -> str:
 
 
 def _make_estimator(task: str, *, classifier: str = "lda", alpha: float = 1.0):
+    """Build the ``StandardScaler`` + estimator pipeline for one decode.
+
+    ``classifier`` selects the estimator within each ``task``:
+
+    * regression: ``"ridge"`` (default, ``Ridge(alpha)``), ``"ridgecv"`` (nested-CV alpha),
+      or the nonlinear branches ``"hgb"`` / ``"rf"`` / ``"krr_rbf"`` / ``"svr_rbf"`` / ``"mlp"``.
+    * classification: ``"lda"`` (default), ``"logistic"``, ``"logl2cv"``, or the nonlinear
+      branches ``"hgb"`` / ``"rf"`` / ``"svc_rbf"`` / ``"mlp"``.
+
+    The nonlinear branches are for the exploratory "does model class change the conclusion?"
+    pass. Their hyperparameters are deliberately small-n-safe (shallow depth-3 trees,
+    ``min_samples_leaf=5``, feature subsampling, strong L2 / ``C``) because the within-subject
+    trial count is ~60; ``early_stopping=False`` because there are too few train rows for an
+    internal validation split. The estimator ``random_state`` is fixed so the only stochasticity
+    a permutation null must absorb is the CV split + label shuffle. A model flexible enough to
+    overfit noise scores just as high on shuffled labels, so its permutation ``null_mean`` rises
+    to meet the observed score and the ``score - null_mean`` second-level test stays honest.
+    """
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -80,6 +98,32 @@ def _make_estimator(task: str, *, classifier: str = "lda", alpha: float = 1.0):
             from sklearn.linear_model import RidgeCV
 
             est = RidgeCV(alphas=np.logspace(-3, 3, 13))
+        elif classifier == "hgb":
+            from sklearn.ensemble import HistGradientBoostingRegressor
+
+            est = HistGradientBoostingRegressor(
+                max_depth=3, max_leaf_nodes=7, learning_rate=0.05, max_iter=200,
+                min_samples_leaf=5, l2_regularization=1.0, early_stopping=False,
+                random_state=0)
+        elif classifier == "rf":
+            from sklearn.ensemble import RandomForestRegressor
+
+            est = RandomForestRegressor(
+                n_estimators=400, max_depth=3, max_features=0.33, min_samples_leaf=5,
+                n_jobs=1, random_state=0)
+        elif classifier == "krr_rbf":
+            from sklearn.kernel_ridge import KernelRidge
+
+            est = KernelRidge(kernel="rbf", alpha=max(alpha, 1.0), gamma=None)
+        elif classifier == "svr_rbf":
+            from sklearn.svm import SVR
+
+            est = SVR(kernel="rbf", C=1.0, epsilon=0.1, gamma="scale")
+        elif classifier == "mlp":
+            from sklearn.neural_network import MLPRegressor
+
+            est = MLPRegressor(hidden_layer_sizes=(32,), alpha=1e-1, max_iter=1000,
+                               random_state=0)
         else:
             from sklearn.linear_model import Ridge
 
@@ -100,6 +144,29 @@ def _make_estimator(task: str, *, classifier: str = "lda", alpha: float = 1.0):
 
             est = LogisticRegressionCV(Cs=np.logspace(-3, 3, 13), penalty="l2",
                                        solver="lbfgs", max_iter=2000)
+        elif classifier == "hgb":
+            from sklearn.ensemble import HistGradientBoostingClassifier
+
+            est = HistGradientBoostingClassifier(
+                max_depth=3, max_leaf_nodes=7, learning_rate=0.05, max_iter=200,
+                min_samples_leaf=5, l2_regularization=1.0, early_stopping=False,
+                random_state=0)
+        elif classifier == "rf":
+            from sklearn.ensemble import RandomForestClassifier
+
+            est = RandomForestClassifier(
+                n_estimators=400, max_depth=3, max_features="sqrt", min_samples_leaf=5,
+                class_weight="balanced", n_jobs=1, random_state=0)
+        elif classifier == "svc_rbf":
+            from sklearn.svm import SVC
+
+            est = SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced",
+                      probability=False, random_state=0)
+        elif classifier == "mlp":
+            from sklearn.neural_network import MLPClassifier
+
+            est = MLPClassifier(hidden_layer_sizes=(32,), alpha=1e-1, max_iter=1000,
+                                random_state=0)
         else:
             raise ValueError(f"unknown classifier={classifier!r}")
     else:

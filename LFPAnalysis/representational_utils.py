@@ -61,15 +61,30 @@ __all__ = [
 # Canonical SNT egocentric geometry
 # --------------------------------------------------------------------------- #
 def canonical_egocentric(x, y, affil=None, power=None, *, frame="pre", pov=(6.0, 0.0)):
-    """Egocentric distance + SIGNED direction, matching the single-unit pipeline.
+    """Egocentric distance + direction (bearing to the POV), matching the single-unit pipeline.
 
     Reproduces ``snt_su/scripts/snt_su_utils_canonical_circ.py::build_trial_table_for_unit``
-    exactly (verified maxΔ=0 vs the stored ``r_current``/``cosine_current``). Use this
-    rather than the stored angle columns, which are sign-blind:
+    exactly (verified maxΔ=0 vs the stored ``r_current``/``cosine_current``).
 
-    * ``raw_angle`` == ``|theta|`` (folded to [0, π]) — loses left/right.
-    * ``cosine_current`` == ``cos(theta)`` — correct cosine, but no sine, so also
-      sign-blind. The **signed** direction needs both ``cos`` and ``sin``.
+    ``theta = atan2(6 - affil, power)``. Because the POV sits at the affiliation edge
+    ``(6, 0)`` and coordinates are bounded by ``6``, ``6 - affil >= 0``, so **theta lies in
+    [0, π] with no wraparound and no left/right sign** — the geometry admits none. (An
+    earlier version of this docstring called theta "signed, ∈[-π, π]" and ``raw_angle``
+    a folded ``|theta|``; both were wrong. Corrected 2026-07-31, see
+    ``snt_lfp/docs/methods/theta_heading_identity_20260731.md`` §2A.)
+
+    Relation to the stored columns, all verified over the n=28 cohort:
+
+    * ``raw_angle`` **==** ``theta`` on the PRE frame (``raw_angle_new`` on POST). It is
+      computed upstream as ``arccos(power / r)`` against the ``+power`` reference axis,
+      which is algebraically identical. The only disagreement is at ``(affil, power) =
+      (6, 0)``, where the bearing is undefined: ``arctan2(0, 0)`` returns 0 here while the
+      upstream ``arccos`` returns π/2 (3 decisions across the cohort).
+    * ``cosine_current`` **==** ``cos(theta)`` **==** ``power / r`` — a monotone transform of
+      ``theta``, not an independent variable. ``r_current * cosine_current`` is exactly the
+      pre-decision power coordinate.
+    * ``angle_current`` / ``angle_new`` are **constant 0** in the stored tables — degenerate,
+      never use them.
 
     Parameters
     ----------
@@ -89,9 +104,9 @@ def canonical_egocentric(x, y, affil=None, power=None, *, frame="pre", pov=(6.0,
 
     Returns
     -------
-    dict with keys ``V`` (distance), ``theta`` (signed angle, rad ∈ [-π, π]),
-    ``cos``, ``sin``, ``x_pos``, ``y_pos`` (allocentric position in this frame),
-    ``x_rel``, ``y_rel`` (POV-relative).
+    dict with keys ``V`` (distance), ``theta`` (bearing to the POV, rad ∈ [0, π]),
+    ``cos`` (= ``power / V``), ``sin`` (= ``(6 - affil) / V``), ``x_pos``, ``y_pos``
+    (allocentric position in this frame), ``x_rel``, ``y_rel`` (POV-relative).
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)

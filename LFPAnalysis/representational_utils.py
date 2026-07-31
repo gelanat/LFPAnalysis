@@ -316,6 +316,16 @@ def _band_envelope(
     return env, times, picks
 
 
+def subband_edges(band: tuple[float, float], n_subbands: int) -> list[tuple[float, float]]:
+    """The ``(lo, hi)`` sub-band edges :func:`_broadband_envelope` splits ``band`` into.
+
+    Exposed so callers can *name* per-sub-band feature columns consistently with the order
+    :func:`_broadband_envelope` emits them in when ``pool_subbands=False``.
+    """
+    e = np.linspace(band[0], band[1], int(n_subbands) + 1)
+    return [(float(lo), float(hi)) for lo, hi in zip(e[:-1], e[1:])]
+
+
 def _broadband_envelope(
     epochs,
     picks: list[str],
@@ -326,6 +336,7 @@ def _broadband_envelope(
     subband_norm: str = "zscore",
     filter_kind: str = "butter",
     order: int = 4,
+    pool_subbands: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Normalized-broadband HFA envelope: per-sub-band normalize, then average.
 
@@ -350,11 +361,22 @@ def _broadband_envelope(
     subband_norm
         ``"zscore"`` -> ``(env - mean) / std`` (equal-variance contribution per band;
         default); ``"mean"`` -> ``env / mean`` (classic fractional-power BHA, stays positive).
+    pool_subbands
+        If True (default) the normalized sub-band envelopes are **averaged** -> one channel
+        per input pick, the canonical BHA estimate. If False they are **stacked** along the
+        channel axis instead (sub-band-major: all picks for sub-band 1, then sub-band 2, ...),
+        so a decoder can weight sub-bands independently. Averaging is only optimal if the
+        sub-bands share a sign; it *cancels* carriers with opposite tuning, which is exactly
+        the assumption ``pool_subbands=False`` exists to test. The returned ``picks`` are
+        expanded to ``"{ch}@{lo:g}-{hi:g}"`` in the emitted order so callers can name columns
+        (see :func:`subband_edges`).
 
     Returns
     -------
     Same ``(env, times, picks)`` contract as :func:`_band_envelope`, so the window
-    reducers are agnostic to which substrate produced the envelope.
+    reducers are agnostic to which substrate produced the envelope. With
+    ``pool_subbands=False`` the channel axis is ``len(picks) * n_subbands`` long and
+    ``picks`` names each column of it.
     """
     picks = [c for c in picks if c in epochs.ch_names]
     times = epochs.times
@@ -370,12 +392,12 @@ def _broadband_envelope(
 
     fs = float(epochs.info["sfreq"])
     data = epochs.get_data(picks=picks, copy=True)  # (n_trials, n_picks, n_times)
-    edges = np.linspace(band[0], band[1], n_subbands + 1)
+    sub = subband_edges(band, n_subbands)
     tiny = np.finfo(float).tiny
     acc = np.zeros((n_trials, len(picks), times.size), dtype=float)
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        env = np.abs(_filter_hilbert(data, fs, (float(lo), float(hi)),
-                                     order=order, filter_kind=filter_kind))
+    blocks, names = [], []
+    for lo, hi in sub:
+        env = np.abs(_filter_hilbert(data, fs, (lo, hi), order=order, filter_kind=filter_kind))
         if kind == "power":
             env = env ** 2
         # per channel x sub-band scalar(s), pooled over (trial, time) -> label-blind
@@ -385,8 +407,14 @@ def _broadband_envelope(
             env = (env - mean) / (std + tiny)
         else:  # "mean"
             env = env / (mean + tiny)
-        acc += env
-    return acc / n_subbands, times, picks
+        if pool_subbands:
+            acc += env
+        else:
+            blocks.append(env)
+            names.extend(f"{ch}@{lo:g}-{hi:g}" for ch in picks)
+    if pool_subbands:
+        return acc / n_subbands, times, picks
+    return np.concatenate(blocks, axis=1), times, names
 
 
 def _window_centers(times, window_s, step_s, tmin, tmax) -> np.ndarray:
@@ -419,6 +447,7 @@ def per_trial_band_power(
     log: bool = True,
     n_subbands: int = 1,
     subband_norm: str = "zscore",
+    pool_subbands: bool = True,
 ) -> np.ndarray:
     """Per-channel, per-trial band power/amplitude over ``[tmin, tmax]``.
 
@@ -445,20 +474,24 @@ def per_trial_band_power(
     log
         If True, return ``log10`` of the reduced value (standard for power,
         stabilises variance across channels). Forced off when ``n_subbands > 1``.
-    n_subbands, subband_norm
+    n_subbands, subband_norm, pool_subbands
         If ``n_subbands > 1``, use the normalized-broadband substrate
         (:func:`_broadband_envelope`, the 1/f-robust HFA estimate) instead of a single
         band-pass. Default ``n_subbands=1`` reproduces the single-band envelope exactly.
+        ``pool_subbands=False`` returns the sub-bands as separate columns
+        (``(n_trials, len(picks) * n_subbands)``, sub-band-major) instead of averaging them.
 
     Returns
     -------
     np.ndarray
-        ``(n_trials, len(picks))``.
+        ``(n_trials, len(picks))`` -- or ``(n_trials, len(picks) * n_subbands)`` when
+        ``n_subbands > 1`` and ``pool_subbands=False``.
     """
     if n_subbands > 1:
         env, times, picks = _broadband_envelope(
             epochs, picks, band, n_subbands=n_subbands, kind=kind,
             subband_norm=subband_norm, filter_kind=filter_kind, order=order,
+            pool_subbands=pool_subbands,
         )
         log = False  # per-sub-band normalization already stabilizes; z-score can be < 0
     else:
@@ -499,11 +532,15 @@ def feature_matrix(
     Returns
     -------
     X : np.ndarray
-        ``(n_trials, n_channels * n_bands)``.
+        ``(n_trials, n_channels * n_bands)`` -- or ``* n_subbands`` again when
+        ``pool_subbands=False`` is passed through to :func:`per_trial_band_power`.
     feature_names : list[str]
-        ``"{channel}|{band}"`` for each column.
+        ``"{channel}|{band}"`` for each column (``"{channel}|{band}@{lo}-{hi}"`` for
+        unpooled sub-bands -- the channel stays the 1st ``|``-token either way, so
+        channel-parsing callers are unaffected).
     picks : list[str]
-        The channels used (in column-block order).
+        The **physical** channels used (in column-block order) -- not expanded by
+        ``pool_subbands=False``, so contact counts stay meaningful.
     """
     picks = picks_in_region(
         elec_df, roi, region_col=region_col, hemi=hemi, ch_names=epochs.ch_names
@@ -511,14 +548,139 @@ def feature_matrix(
     if not picks:
         return np.empty((len(epochs), 0), dtype=float), [], []
 
+    n_sb = int(power_kw.get("n_subbands", 1))
+    unpooled = n_sb > 1 and not power_kw.get("pool_subbands", True)
     blocks, names = [], []
     for bname, band in bands.items():
         blocks.append(
             per_trial_band_power(epochs, picks, band, tmin, tmax, kind=kind, **power_kw)
         )
-        names.extend(f"{ch}|{bname}" for ch in picks)
+        if unpooled:  # sub-band-major, matching _broadband_envelope's emission order
+            names.extend(f"{ch}|{bname}@{lo:g}-{hi:g}"
+                         for lo, hi in subband_edges(band, n_sb) for ch in picks)
+        else:
+            names.extend(f"{ch}|{bname}" for ch in picks)
     X = np.concatenate(blocks, axis=1)
     return X, names, picks
+
+
+def _runs_at_least(mask: np.ndarray, min_len: int) -> np.ndarray:
+    """Keep only suprathreshold runs of at least ``min_len`` consecutive True (last axis).
+
+    Vectorised morphological opening via two cumulative sums: a length-``min_len`` window is
+    "full" when it contains ``min_len`` Trues, and a sample survives when it is covered by at
+    least one full window. Equivalent to erosion-then-dilation with a length-``min_len``
+    structuring element, without looping over trials x channels.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    L = max(int(min_len), 1)
+    n = mask.shape[-1]
+    if L <= 1:
+        return mask
+    if n < L:
+        return np.zeros_like(mask)
+    z = np.zeros(mask.shape[:-1] + (1,), dtype=np.int64)
+    c = np.concatenate([z, np.cumsum(mask, axis=-1, dtype=np.int64)], axis=-1)
+    full = (c[..., L:] - c[..., :-L]) == L                # (..., n - L + 1) window fully True
+    c2 = np.concatenate([z, np.cumsum(full, axis=-1, dtype=np.int64)], axis=-1)
+    # sample i survives iff any full window starting in [i - L + 1, i] exists
+    hi = np.clip(np.arange(n) + 1, 0, full.shape[-1])
+    lo = np.clip(np.arange(n) - L + 1, 0, full.shape[-1])
+    return (c2[..., hi] - c2[..., lo]) > 0
+
+
+def per_trial_hfa_burst_features(
+    epochs,
+    picks: list[str],
+    band: tuple[float, float],
+    tmin: float,
+    tmax: float,
+    *,
+    n_subbands: int = 8,
+    subband_norm: str = "zscore",
+    thresh_sd: float = 2.0,
+    min_cycles: float = 3.0,
+    filter_kind: str = "butter",
+    order: int = 4,
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Per-channel, per-trial HFA **burst** features over ``[tmin, tmax]``.
+
+    Window-averaged HFA power assumes a *rate-coded* signal. High-frequency activity is
+    however substantially **transient** -- brief suprathreshold excursions rather than a
+    sustained level (Ray & Maunsell 2011, PLoS Biol; Lundqvist et al. 2016, Neuron, for the
+    equivalent argument in gamma) -- and a code carried by *when/how often* bursts occur is
+    partly invisible to the window mean. This reducer exposes that structure.
+
+    The substrate is the same normalized-broadband envelope as :func:`per_trial_band_power`
+    (``kind="amplitude"``), re-standardised **per channel over the pooled (trial, time) axes**
+    so ``thresh_sd`` is in genuine SD units of that channel's own envelope. Thresholding is
+    therefore label-blind, exactly as the sub-band normalisation is. Detection runs on the
+    whole epoch (no edge transients) and is *then* cropped to ``[tmin, tmax]``.
+
+    Parameters
+    ----------
+    thresh_sd
+        Burst threshold in SD of the channel's pooled envelope (default 2.0).
+    min_cycles
+        Minimum burst duration in cycles of the band's centre frequency (default 3 ->
+        ~27 ms at a 110 Hz centre). Runs shorter than this are discarded.
+
+    Returns
+    -------
+    feats : dict[str, np.ndarray]
+        Each value is ``(n_trials, len(picks))``:
+        ``burst_rate`` (bursts/s), ``burst_occ`` (fraction of window suprathreshold),
+        ``burst_amp`` (mean envelope SD over suprathreshold samples; 0 when none),
+        ``burst_ampocc`` (``burst_amp * burst_occ``, total burst "mass"),
+        ``burst_meandur`` (mean burst duration, s; 0 when none).
+    picks : list[str]
+        The picks actually present in ``epochs`` (order preserved).
+    """
+    env, times, picks = _broadband_envelope(
+        epochs, picks, band, n_subbands=n_subbands, kind="amplitude",
+        subband_norm=subband_norm, filter_kind=filter_kind, order=order, pool_subbands=True,
+    )
+    n_trials = len(epochs)
+    keys = ("burst_rate", "burst_occ", "burst_amp", "burst_ampocc", "burst_meandur")
+    if not picks:
+        return {k: np.empty((n_trials, 0), dtype=float) for k in keys}, picks
+
+    # channel-wise standardisation over the pooled (trial, time) axes -> label-blind
+    tiny = np.finfo(float).tiny
+    mu = env.mean(axis=(0, 2), keepdims=True)
+    sd = env.std(axis=(0, 2), keepdims=True)
+    z = (env - mu) / (sd + tiny)
+
+    fs = float(epochs.info["sfreq"])
+    centre = 0.5 * (band[0] + band[1])
+    min_len = max(int(round(min_cycles / centre * fs)), 1)
+    supra = _runs_at_least(z >= float(thresh_sd), min_len)   # detect on the FULL epoch
+
+    wmask = (times >= tmin) & (times <= tmax)
+    if not wmask.any():
+        raise ValueError(f"window [{tmin}, {tmax}] selects no samples in {times[0]}..{times[-1]}")
+    s = supra[:, :, wmask]
+    zw = z[:, :, wmask]
+    n_win = int(wmask.sum())
+    dur_s = n_win / fs
+
+    onsets = np.zeros_like(s)
+    onsets[:, :, 0] = s[:, :, 0]
+    onsets[:, :, 1:] = s[:, :, 1:] & ~s[:, :, :-1]
+    n_burst = onsets.sum(axis=2).astype(float)
+    occ = s.mean(axis=2)
+    n_supra = s.sum(axis=2)
+    amp = np.divide(np.where(s, zw, 0.0).sum(axis=2), np.maximum(n_supra, 1),
+                    out=np.zeros_like(occ), where=n_supra > 0)
+    meandur = np.divide(n_supra / fs, np.maximum(n_burst, 1),
+                        out=np.zeros_like(occ), where=n_burst > 0)
+    return {
+        "burst_rate": n_burst / dur_s,
+        "burst_occ": occ,
+        "burst_amp": amp,
+        "burst_ampocc": amp * occ,
+        "burst_meandur": meandur,
+    }, picks
 
 
 # --------------------------------------------------------------------------- #

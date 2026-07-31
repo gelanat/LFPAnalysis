@@ -720,6 +720,158 @@ def _interp_notch(log_psd, freqs, notch_freqs, width):
     return flat.reshape(out.shape)
 
 
+def per_trial_aperiodic_params(
+    epochs,
+    picks,
+    *,
+    tmin=None,
+    tmax=None,
+    fit_range=(30.0, 150.0),
+    aperiodic_mode="fixed",
+    flat_bands=None,
+    peak_width_limits=(2.0, 20.0),
+    max_n_peaks=3,
+    min_peak_height=0.05,
+    peak_threshold=2.0,
+    psd_method="multitaper",
+    psd_kwargs=None,
+    notch_freqs=(60.0, 120.0),
+    notch_width=3.0,
+    r2_min=0.90,
+    error_max=0.20,
+    psd=None,
+):
+    """**Per-trial** aperiodic parameters + flattened band power (specparam / FOOOF).
+
+    The complement to :func:`aperiodic_corrected_band_power`, which fits the (robust,
+    trial-averaged) spectrum and — with ``per_trial=True`` — holds that aperiodic *fixed*
+    across trials. That is the right choice when the periodic band power is the quantity of
+    interest. It is the wrong choice when the **aperiodic component itself is the trial-varying
+    signal**: a broadband 1/f offset shift is the macroscale correlate of population firing
+    rate (Manning et al. 2009, J Neurosci 29:13613; Miller 2010, J Neurosci 30:6477), and the
+    exponent tracks E/I balance — both are then *targets*, not nuisances. So here every trial
+    gets its own fit.
+
+    Fit over ``fit_range`` in ``"fixed"`` mode by default: above the low-frequency knee, iEEG
+    spectra are well described by a single log-log slope, and a knee fit on a 30-150 Hz range
+    is under-determined. Line noise is removed by log-linear interpolation across
+    ``notch_freqs +/- notch_width`` *before* fitting (:func:`_interp_notch` — dropping bins
+    would break FOOOF's equidistant-frequency requirement). Fit QC (``r_squared``,
+    ``fit_error``) comes back per (trial, channel) so attrition is auditable rather than silent
+    (project rigor floor: FOOOF fits filtered by R^2/QC when aperiodic is the observable).
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Preloaded epochs (or any object exposing ``compute_psd``/``ch_names``).
+    picks : list[str]
+        Channel names (order preserved; names absent from ``epochs`` are skipped).
+    fit_range : tuple
+        FOOOF fit range. Default (30, 150) = the high-frequency range where BHA lives.
+    flat_bands : dict[str, tuple[float, float]] | None
+        Bands to report *flattened* (aperiodic-removed) mean log-power for, e.g.
+        ``{"hfa": (70, 150)}``. Bands outside ``fit_range`` are returned as NaN.
+    r2_min, error_max : float
+        ``qc_pass = fit_ok & (r_squared >= r2_min) & (fit_error <= error_max)``.
+        **Calibrated for SINGLE-TRIAL spectra**, which are far rougher than the trial-averaged
+        ones :func:`aperiodic_corrected_band_power` fits: on 3-s iEEG multitaper spectra over
+        30-150 Hz the fit error sits at a median of ~0.12, so that function's ``error_max=0.10``
+        rejects ~93% of *good* fits (median R^2 0.94). ``0.20`` keeps ~75-80% and rejects genuine
+        failures. The criterion is fit quality only — it never sees a trial label — so tightening
+        or loosening it cannot leak into a downstream decode.
+    psd : tuple(np.ndarray, np.ndarray), optional
+        Precomputed ``(psds, freqs)`` with ``psds`` of shape ``(n_trials, n_picks, n_freq)``
+        in ``picks`` order — bypasses ``epochs.compute_psd`` (used by the self-tests).
+
+    Returns
+    -------
+    dict
+        ``offset``, ``exponent``, ``r_squared``, ``fit_error`` — each ``(n_trials, n_picks)``
+        float; ``qc_pass`` — ``(n_trials, n_picks)`` bool; ``flat_{name}`` — ``(n_trials,
+        n_picks)`` per entry of ``flat_bands``; ``picks`` — the channels used;
+        ``n_trials``, ``fit_range``, ``aperiodic_mode``.
+    """
+    from fooof import FOOOFGroup
+
+    psd_kwargs = dict(psd_kwargs or {})
+    if hasattr(epochs, "ch_names"):
+        picks = [c for c in picks if c in epochs.ch_names]
+    else:
+        picks = list(picks)
+    flat_bands = dict(flat_bands or {})
+    if not picks:
+        empty = np.empty((0, 0), dtype=float)
+        out = {k: empty for k in ("offset", "exponent", "r_squared", "fit_error")}
+        out["qc_pass"] = np.empty((0, 0), dtype=bool)
+        out.update({f"flat_{b}": empty for b in flat_bands})
+        out.update(picks=picks, n_trials=0, fit_range=tuple(fit_range),
+                   aperiodic_mode=aperiodic_mode)
+        return out
+
+    lo_all = min([fit_range[0]] + [v[0] for v in flat_bands.values()])
+    hi_all = max([fit_range[1]] + [v[1] for v in flat_bands.values()])
+    if psd is not None:
+        psds, freqs = psd
+        psds = np.asarray(psds, dtype=float)
+    else:
+        spec = epochs.compute_psd(method=psd_method, tmin=tmin, tmax=tmax,
+                                  fmin=lo_all, fmax=hi_all, picks=picks,
+                                  verbose="ERROR", **psd_kwargs)
+        psds, freqs = spec.get_data(return_freqs=True)   # (n_trials, n_picks, n_freq)
+    freqs = np.asarray(freqs, dtype=float)
+    log_psds = np.log10(np.clip(psds, 1e-20, None))
+    if notch_freqs:
+        log_psds = _interp_notch(log_psds, freqs, notch_freqs, notch_width)
+
+    n_trials, n_picks = log_psds.shape[0], len(picks)
+    fit_mask = (freqs >= fit_range[0]) & (freqs <= fit_range[1])
+    fit_freqs = freqs[fit_mask]
+    nanmat = lambda: np.full((n_trials, n_picks), np.nan)          # noqa: E731
+    out = {k: nanmat() for k in ("offset", "exponent", "r_squared", "fit_error")}
+    out["qc_pass"] = np.zeros((n_trials, n_picks), dtype=bool)
+    for b in flat_bands:
+        out[f"flat_{b}"] = nanmat()
+
+    for ci in range(n_picks):
+        spec_ci = 10.0 ** log_psds[:, ci, fit_mask]
+        ok = np.isfinite(spec_ci).all(axis=1) & (spec_ci > 0).all(axis=1)
+        if not ok.any():
+            continue
+        fg = FOOOFGroup(peak_width_limits=list(peak_width_limits), max_n_peaks=max_n_peaks,
+                        min_peak_height=min_peak_height, peak_threshold=peak_threshold,
+                        aperiodic_mode=aperiodic_mode, verbose=False)
+        try:
+            fg.fit(fit_freqs, spec_ci[ok], fit_range)
+        except Exception:
+            continue
+        rows = np.where(ok)[0]
+        ap = np.asarray(fg.get_params("aperiodic_params"), dtype=float).reshape(len(rows), -1)
+        r2 = np.asarray(fg.get_params("r_squared"), dtype=float).ravel()
+        err = np.asarray(fg.get_params("error"), dtype=float).ravel()
+        out["offset"][rows, ci] = ap[:, 0]
+        out["exponent"][rows, ci] = ap[:, -1]
+        out["r_squared"][rows, ci] = r2
+        out["fit_error"][rows, ci] = err
+        good = np.isfinite(ap).all(axis=1) & np.isfinite(r2)
+        out["qc_pass"][rows, ci] = good & (r2 >= r2_min) & (err <= error_max)
+        if not flat_bands:
+            continue
+        for bname, (blo, bhi) in flat_bands.items():
+            bmask = (freqs >= blo) & (freqs <= bhi)
+            if not bmask.any() or blo < fit_range[0] or bhi > fit_range[1]:
+                continue
+            for k, ti in enumerate(rows):
+                if not good[k]:
+                    continue
+                ap_log = _eval_aperiodic(freqs[bmask], ap[k], aperiodic_mode)
+                out[f"flat_{bname}"][ti, ci] = float(
+                    (log_psds[ti, ci, bmask] - ap_log).mean())
+
+    out.update(picks=picks, n_trials=int(n_trials), fit_range=tuple(fit_range),
+               aperiodic_mode=aperiodic_mode)
+    return out
+
+
 def aperiodic_corrected_band_power(
     epochs,
     picks,

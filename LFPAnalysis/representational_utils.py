@@ -352,6 +352,7 @@ def _broadband_envelope(
     filter_kind: str = "butter",
     order: int = 4,
     pool_subbands: bool = True,
+    norm_fit_idx: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Normalized-broadband HFA envelope: per-sub-band normalize, then average.
 
@@ -376,6 +377,21 @@ def _broadband_envelope(
     subband_norm
         ``"zscore"`` -> ``(env - mean) / std`` (equal-variance contribution per band;
         default); ``"mean"`` -> ``env / mean`` (classic fractional-power BHA, stays positive).
+    norm_fit_idx
+        Trials over which to estimate the normalization statistics. ``None`` (default) uses
+        **all** trials -- the pooled, label-blind behaviour described above, and the
+        published one. Pass the *training* trial indices (integer array or boolean mask of
+        length ``n_trials``) to make the transform **inductive** rather than transductive:
+        the statistics are then estimated without seeing the held-out trials, and applied
+        to all of them.
+
+        Pooled normalization is label-blind, so it cannot manufacture a within-subject
+        decoding effect. It is nevertheless *transductive* across a train/test split -- the
+        held-out trials contribute to the per-channel scale, and because sub-band averaging
+        happens **after** normalization the scaling is not undoable by a downstream
+        ``StandardScaler``. For a **cross-condition generalization** claim (train on one set
+        of conditions, test on held-out ones) fit on the training trials only, and report the
+        pooled-norm arm alongside as a sensitivity check.
     pool_subbands
         If True (default) the normalized sub-band envelopes are **averaged** -> one channel
         per input pick, the canonical BHA estimate. If False they are **stacked** along the
@@ -404,6 +420,22 @@ def _broadband_envelope(
         raise ValueError(f"subband_norm must be 'zscore' or 'mean', got {subband_norm!r}")
     if kind not in ("power", "amplitude"):
         raise ValueError(f"kind must be 'power' or 'amplitude', got {kind!r}")
+    if norm_fit_idx is not None:
+        norm_fit_idx = np.asarray(norm_fit_idx)
+        if norm_fit_idx.dtype == bool:
+            if norm_fit_idx.shape != (n_trials,):
+                raise ValueError(
+                    f"boolean norm_fit_idx must have shape ({n_trials},), "
+                    f"got {norm_fit_idx.shape}"
+                )
+            norm_fit_idx = np.flatnonzero(norm_fit_idx)
+        if norm_fit_idx.size == 0:
+            raise ValueError("norm_fit_idx selects no trials")
+        if norm_fit_idx.min() < 0 or norm_fit_idx.max() >= n_trials:
+            raise ValueError(
+                f"norm_fit_idx out of range for {n_trials} trials "
+                f"(min {norm_fit_idx.min()}, max {norm_fit_idx.max()})"
+            )
 
     fs = float(epochs.info["sfreq"])
     data = epochs.get_data(picks=picks, copy=True)  # (n_trials, n_picks, n_times)
@@ -415,10 +447,13 @@ def _broadband_envelope(
         env = np.abs(_filter_hilbert(data, fs, (lo, hi), order=order, filter_kind=filter_kind))
         if kind == "power":
             env = env ** 2
-        # per channel x sub-band scalar(s), pooled over (trial, time) -> label-blind
-        mean = env.mean(axis=(0, 2), keepdims=True)
+        # per channel x sub-band scalar(s), pooled over (trial, time) -> label-blind.
+        # norm_fit_idx restricts the *estimation* trials (inductive); the transform is
+        # always applied to every trial.
+        fit = env if norm_fit_idx is None else env[norm_fit_idx]
+        mean = fit.mean(axis=(0, 2), keepdims=True)
         if subband_norm == "zscore":
-            std = env.std(axis=(0, 2), keepdims=True)
+            std = fit.std(axis=(0, 2), keepdims=True)
             env = (env - mean) / (std + tiny)
         else:  # "mean"
             env = env / (mean + tiny)
@@ -463,6 +498,7 @@ def per_trial_band_power(
     n_subbands: int = 1,
     subband_norm: str = "zscore",
     pool_subbands: bool = True,
+    norm_fit_idx: np.ndarray | None = None,
 ) -> np.ndarray:
     """Per-channel, per-trial band power/amplitude over ``[tmin, tmax]``.
 
@@ -495,6 +531,11 @@ def per_trial_band_power(
         band-pass. Default ``n_subbands=1`` reproduces the single-band envelope exactly.
         ``pool_subbands=False`` returns the sub-bands as separate columns
         (``(n_trials, len(picks) * n_subbands)``, sub-band-major) instead of averaging them.
+    norm_fit_idx
+        Trials on which to estimate the sub-band normalization statistics (see
+        :func:`_broadband_envelope`). Only meaningful with ``n_subbands > 1``; passing it
+        with ``n_subbands == 1`` **raises** rather than silently doing nothing, because the
+        single-band path has no normalization step to restrict.
 
     Returns
     -------
@@ -506,10 +547,15 @@ def per_trial_band_power(
         env, times, picks = _broadband_envelope(
             epochs, picks, band, n_subbands=n_subbands, kind=kind,
             subband_norm=subband_norm, filter_kind=filter_kind, order=order,
-            pool_subbands=pool_subbands,
+            pool_subbands=pool_subbands, norm_fit_idx=norm_fit_idx,
         )
         log = False  # per-sub-band normalization already stabilizes; z-score can be < 0
     else:
+        if norm_fit_idx is not None:
+            raise ValueError(
+                "norm_fit_idx requires n_subbands > 1 -- the single-band path has no "
+                "normalization step to restrict, so honouring it silently would be a no-op"
+            )
         env, times, picks = _band_envelope(
             epochs, picks, band, kind=kind, filter_kind=filter_kind, order=order
         )
@@ -543,6 +589,11 @@ def feature_matrix(
 
     Concatenates :func:`per_trial_band_power` across ``bands`` for every
     channel of ``roi``.
+
+    ``power_kw`` is forwarded verbatim to :func:`per_trial_band_power`, so
+    ``norm_fit_idx=<training trial indices>`` reaches :func:`_broadband_envelope` and makes
+    the broadband normalization inductive -- use it for cross-condition generalization
+    (CCGP / leave-one-character-out) feature extraction.
 
     Returns
     -------

@@ -122,9 +122,96 @@ def test_broadband_equalizes_1_over_f():
     assert bb_high > 0.2
 
 
+# ---------------------------------------------------------------------------
+# norm_fit_idx -- inductive (train-only) sub-band normalization
+#
+# The published behaviour pools the normalization statistics over ALL trials. That is
+# label-blind, so it cannot manufacture a within-subject decoding effect, but it IS
+# transductive across a train/test split: held-out trials contribute to the per-channel
+# scale, and because sub-band averaging happens AFTER normalization the scaling is not
+# undoable by a downstream StandardScaler. `norm_fit_idx` restricts the estimation trials
+# so a cross-condition-generalization claim can be made inductively.
+# ---------------------------------------------------------------------------
+
+
+def test_norm_fit_idx_default_matches_all_trials():
+    """FROZEN-PIPELINE GUARD: None (default) == explicitly passing every trial."""
+    ep = _white(4)
+    picks = ["a", "b"]
+    kw = dict(n_subbands=8, subband_norm="zscore")
+    default = per_trial_band_power(ep, picks, BAND, TMIN, TMAX, **kw)
+    all_idx = per_trial_band_power(
+        ep, picks, BAND, TMIN, TMAX, norm_fit_idx=np.arange(N_EP), **kw)
+    assert np.array_equal(default, all_idx)
+
+
+def test_norm_fit_idx_is_inductive():
+    """THE LOAD-BEARING TEST: fitting the norm on a train subset gives those trials
+    exactly the features they would have had if the test trials had never been seen.
+
+    Band-pass + Hilbert is per-trial (filtfilt runs along the time axis), so the only
+    channel that could carry test-trial information into a train-trial feature is the
+    normalization scalar. If train features computed from the FULL epoch set with
+    norm_fit_idx=train equal train features computed from epochs[train] alone, that
+    channel is closed.
+    """
+    ep = _white(5)
+    picks = ["a", "b"]
+    kw = dict(n_subbands=8, subband_norm="zscore")
+    rng = np.random.default_rng(0)
+    train = np.sort(rng.choice(N_EP, size=40, replace=False))
+
+    full = per_trial_band_power(ep, picks, BAND, TMIN, TMAX, norm_fit_idx=train, **kw)
+    train_only = per_trial_band_power(ep[train], picks, BAND, TMIN, TMAX, **kw)
+    assert np.allclose(full[train], train_only, rtol=1e-10, atol=1e-12)
+
+    # and the transform is still APPLIED to the held-out trials (they are not dropped)
+    assert full.shape == (N_EP, len(picks))
+    assert np.isfinite(full).all()
+
+    # ... while differing from the transductive (pooled-norm) version, i.e. it does something
+    pooled = per_trial_band_power(ep, picks, BAND, TMIN, TMAX, **kw)
+    assert not np.allclose(full, pooled)
+
+
+def test_norm_fit_idx_bool_mask_equals_integer_index():
+    ep = _white(6)
+    picks = ["a", "b"]
+    kw = dict(n_subbands=8, subband_norm="mean")
+    train = np.arange(0, N_EP, 2)
+    mask = np.zeros(N_EP, dtype=bool)
+    mask[train] = True
+    assert np.array_equal(
+        per_trial_band_power(ep, picks, BAND, TMIN, TMAX, norm_fit_idx=train, **kw),
+        per_trial_band_power(ep, picks, BAND, TMIN, TMAX, norm_fit_idx=mask, **kw),
+    )
+
+
+def test_norm_fit_idx_rejects_silent_noops_and_bad_input():
+    """A no-op must raise, not be honoured silently -- the single-band path has no
+    normalization step to restrict."""
+    ep = _white(7)
+    picks = ["a"]
+    for bad, kw in [
+        (np.arange(10), dict(n_subbands=1)),                        # nothing to restrict
+        (np.array([], dtype=int), dict(n_subbands=8)),              # selects no trials
+        (np.array([N_EP]), dict(n_subbands=8)),                     # out of range
+        (np.zeros(3, dtype=bool), dict(n_subbands=8)),              # wrong-length bool mask
+    ]:
+        try:
+            per_trial_band_power(ep, picks, BAND, TMIN, TMAX, norm_fit_idx=bad, **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for norm_fit_idx={bad!r}, kw={kw}")
+
+
 if __name__ == "__main__":
     test_single_band_is_byte_identical()
     test_timeresolved_default_unchanged()
     test_broadband_shape_and_finite()
     test_broadband_equalizes_1_over_f()
+    test_norm_fit_idx_default_matches_all_trials()
+    test_norm_fit_idx_is_inductive()
+    test_norm_fit_idx_bool_mask_equals_integer_index()
+    test_norm_fit_idx_rejects_silent_noops_and_bad_input()
     print("all broadband-envelope tests passed")

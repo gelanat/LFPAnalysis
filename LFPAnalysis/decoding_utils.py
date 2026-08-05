@@ -27,6 +27,7 @@ __all__ = [
     "infer_task",
     "residualize_columns",
     "decode_cv",
+    "decode_cv_oof",
     "decode_with_permutation",
     "decode_crossgen",
     "decode_crossgen_grouped",
@@ -302,6 +303,72 @@ def decode_with_permutation(
     }
 
 
+def decode_cv_oof(
+    X,
+    y,
+    *,
+    n_splits: int = 5,
+    classifier: str = "lda",
+    alpha: float = 1.0,
+    random_state: int = 0,
+) -> dict:
+    """Per-trial out-of-fold decision margins from a cross-validated *binary* classifier.
+
+    Companion to :func:`decode_cv` for callers that need the trial-level signed margin
+    — e.g. to regress decode confidence on a trial-level moderator — rather than only the
+    pooled balanced accuracy. Same StandardScaler+estimator pipeline and StratifiedKFold as
+    :func:`decode_cv`, but returns ``cross_val_predict(..., method="decision_function")``:
+    the out-of-fold signed distance to the boundary (positive => the classifier leans to
+    ``classes_[1]``, i.e. the larger label). Binary only; the estimator must expose
+    ``decision_function`` (lda/logreg/svc — not mlp).
+
+    Because the margin is out-of-fold, trial *t* never trains its own margin — the standard
+    guard against double-dipping when the margin is later related to a per-trial covariate.
+
+    Returns input-aligned arrays (non-finite rows are NaN and flagged in ``finite``):
+
+    * ``margin`` — OOF signed margin, ``(n_trials,)``.
+    * ``pred``   — OOF predicted label (margin > 0), ``(n_trials,)``.
+    * ``finite`` — bool mask of decoded rows; ``n`` its count.
+
+    On too-few-classes / too-few-samples returns all-NaN margins with a ``note``.
+    """
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y)
+    n_all = len(y)
+    finite = np.isfinite(X).all(axis=1)
+    Xf, yf = X[finite], y[finite]
+
+    out = {
+        "margin": np.full(n_all, np.nan),
+        "pred": np.full(n_all, np.nan),
+        "finite": finite,
+        "n": int(finite.sum()),
+        "score_name": "oof_decision_function",
+        "chance": 0.0,
+    }
+
+    classes, counts = np.unique(yf, return_counts=True)
+    if len(classes) != 2 or counts.min() < 2:
+        out["note"] = "decode_cv_oof needs exactly 2 classes with >=2 samples each"
+        return out
+    k = int(min(n_splits, counts.min()))
+    if k < 2:
+        out["note"] = "too few samples for CV"
+        return out
+
+    est = _make_estimator("classification", classifier=classifier, alpha=alpha)
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+    margin = np.asarray(
+        cross_val_predict(est, Xf, yf, cv=cv, method="decision_function"), dtype=float
+    ).ravel()
+    out["margin"][finite] = margin
+    out["pred"][finite] = (margin > 0).astype(float)
+    return out
+
+
 def _fit_residualizer(X, confound):
     """Fit a linear (intercept + standardised confound) residualizer on TRAIN rows.
 
@@ -469,7 +536,8 @@ def decode_crossgen(X_train, y_train, X_test, y_test, *, task: str | None = None
 def decode_crossgen_grouped(X, y, groups, *, fold: str = "leave_one_group_out",
                             task: str | None = None, classifier: str = "lda", alpha: float = 1.0,
                             n_perm: int = 200, random_state: int = 0,
-                            rng: np.random.Generator | None = None, confound=None) -> dict:
+                            rng: np.random.Generator | None = None, confound=None,
+                            X_by_group: dict | None = None) -> dict:
     """Leave-one-group-out cross-generalisation, averaged over folds (CCGP-style abstraction test).
 
     For each unique level of ``groups`` (e.g. character identity), train on all other groups and test
@@ -479,6 +547,15 @@ def decode_crossgen_grouped(X, y, groups, *, fold: str = "leave_one_group_out",
     per-permutation-index fold averages are independent Monte-Carlo draws of the averaged statistic;
     folds shorter than ``n_perm`` are chance-padded). The primary inference remains the across-subject
     test on the returned ``score``.
+
+    ``X_by_group``
+        Optional ``{level: X_level}`` mapping. When given, fold ``lv`` uses ``X_by_group[lv]``
+        (same shape as ``X``, same row order) instead of ``X``. This exists so the FEATURE
+        EXTRACTION itself can be made inductive -- e.g. broadband sub-band normalization fit on
+        the training characters only (``representational_utils.feature_matrix(...,
+        norm_fit_idx=train_rows)``) -- without re-implementing the fold loop, the trial-count
+        weighting, or the element-wise fold-null averaging out here. ``X`` is still required and
+        is used for any level missing from the mapping.
 
     Only ``fold="leave_one_group_out"`` is implemented. Returns the :func:`decode_crossgen` dict shape
     plus ``n_folds`` and ``fold_scores``.
@@ -490,6 +567,12 @@ def decode_crossgen_grouped(X, y, groups, *, fold: str = "leave_one_group_out",
     X = np.asarray(X, dtype=float)
     y = np.asarray(y)
     g = np.asarray(groups)
+    if X_by_group is not None:
+        bad = {k: np.asarray(v).shape for k, v in X_by_group.items()
+               if np.asarray(v).shape != X.shape}
+        if bad:
+            raise ValueError(
+                f"X_by_group entries must match X.shape={X.shape}; got {bad}")
     conf = None if confound is None else np.asarray(confound, float)
     levels = list(np.unique(g))
     task = task or infer_task(y)
@@ -501,8 +584,9 @@ def decode_crossgen_grouped(X, y, groups, *, fold: str = "leave_one_group_out",
         ct = None if conf is None else conf[tr]
         ce = None if conf is None else conf[te]
         fr = np.random.default_rng(random_state + 1 + j)
+        Xf = X if X_by_group is None else np.asarray(X_by_group.get(lv, X), dtype=float)
         sc, ch, _sname, null, ntr, nte, task = _crossgen_core(
-            X[tr], y[tr], X[te], y[te], task=task, classifier=classifier, alpha=alpha,
+            Xf[tr], y[tr], Xf[te], y[te], task=task, classifier=classifier, alpha=alpha,
             n_perm=n_perm, rng=fr, C_train=ct, C_test=ce, shared_labels=False,
         )
         if not np.isfinite(sc):

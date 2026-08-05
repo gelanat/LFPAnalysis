@@ -123,6 +123,67 @@ def test_crossgen_mismatched_confound_args_raise():
         raise AssertionError("expected ValueError when only one of C_train/C_test is given")
 
 
+# ---------------------------------------------------------------------------
+# X_by_group -- per-fold feature matrices (inductive feature extraction)
+#
+# Exists so the feature EXTRACTION can be fit on training groups only (e.g. broadband
+# sub-band normalization via representational_utils.feature_matrix(norm_fit_idx=...))
+# without re-implementing the fold loop, the trial-count weighting, or the element-wise
+# fold-null averaging in the analysis scripts.
+# ---------------------------------------------------------------------------
+
+
+def _grouped_fixture(seed=11, n=200, p=150, k=5, sep=1.2, n_groups=5):
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n, p))
+    y = (rng.random(n) < 0.5).astype(int)
+    X[:, :k] += sep * (y[:, None] - 0.5)
+    groups = rng.integers(0, n_groups, size=n)
+    return X, y, groups
+
+
+def test_crossgen_grouped_x_by_group_defaults_are_identical():
+    """FROZEN-PIPELINE GUARD: None, {}, and an all-levels-mapped-to-X dict agree exactly."""
+    X, y, g = _grouped_fixture()
+    kw = dict(n_perm=100, random_state=0)
+    base = du.decode_crossgen_grouped(X, y, g, **kw)
+    empty = du.decode_crossgen_grouped(X, y, g, X_by_group={}, **kw)
+    ident = du.decode_crossgen_grouped(
+        X, y, g, X_by_group={lv: X for lv in np.unique(g)}, **kw)
+    for other in (empty, ident):
+        assert other["score"] == base["score"]
+        assert other["p"] == base["p"]
+        assert other["fold_scores"] == base["fold_scores"]
+
+
+def test_crossgen_grouped_x_by_group_is_used_per_fold():
+    """Destroying the signal in the matrix used for ONE held-out level must lower the
+    average and that fold's score specifically -- proving the mapping is per-fold, not global."""
+    X, y, g = _grouped_fixture(seed=12)
+    levels = list(np.unique(g))
+    victim = levels[0]
+    rng = np.random.default_rng(0)
+    X_dead = rng.standard_normal(X.shape)              # same shape, no signal at all
+    kw = dict(n_perm=50, random_state=0)
+    base = du.decode_crossgen_grouped(X, y, g, **kw)
+    swapped = du.decode_crossgen_grouped(X, y, g, X_by_group={victim: X_dead}, **kw)
+
+    assert swapped["n_folds"] == base["n_folds"]
+    assert swapped["fold_scores"][0] < base["fold_scores"][0]     # the swapped fold degrades
+    assert swapped["fold_scores"][1:] == base["fold_scores"][1:]  # the others are untouched
+    assert swapped["score"] < base["score"]
+
+
+def test_crossgen_grouped_x_by_group_shape_mismatch_raises():
+    X, y, g = _grouped_fixture(seed=13)
+    lv = np.unique(g)[0]
+    try:
+        du.decode_crossgen_grouped(X, y, g, X_by_group={lv: X[:, :3]}, n_perm=0)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError on X_by_group shape mismatch")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

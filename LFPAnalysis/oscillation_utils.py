@@ -630,6 +630,111 @@ def compute_pte_per_trial(mne_data, indices, band, delay=None, n_bins=4,
     return out
 
 
+def _per_trial_time_corr(a, b):
+    """Row-wise (per-trial) Pearson correlation over the time axis.
+
+    ``a``, ``b`` : real arrays ``(n_trials, n_times)``. Returns ``(n_trials,)`` with the
+    Pearson r of each trial's two series across time; zero-variance rows -> NaN.
+    """
+    a = a - a.mean(axis=-1, keepdims=True)
+    b = b - b.mean(axis=-1, keepdims=True)
+    num = (a * b).sum(axis=-1)
+    den = np.sqrt((a * a).sum(axis=-1) * (b * b).sum(axis=-1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = num / den
+    r = np.asarray(r, dtype=float)
+    r[~np.isfinite(r)] = np.nan
+    return r
+
+
+def compute_aec_per_trial(mne_data, indices, band, *, tmin=None, tmax=None,
+                          n_subbands=8, orthogonalize=True, kind="power",
+                          filter_kind="butter", order=4):
+    """Per-trial amplitude-envelope correlation (AEC) over a band. Returns ``(n_epochs, n_pairs)``.
+
+    The amplitude-domain analogue of ``compute_psi_per_trial`` / ``compute_pte_per_trial`` and the
+    same contract: one scalar per trial per seed->target pair, correlating the two channels' band
+    envelopes **across time within the trial window** ``[tmin, tmax)``. Intended for trial-resolved
+    regression with subject-level inference, not single-trial significance.
+
+    ``band`` is split into ``n_subbands`` equal sub-bands (8 -> the canonical 1/f-robust broadband
+    HFA when ``band=(70, 150)``; 1 -> a single band-pass for lower narrowbands). Each sub-band is
+    band-pass + Hilbert filtered over the *whole* epoch (so the analysis window is free of filter
+    edge transients, matching ``representational_utils._band_envelope``), then cropped to the
+    window; the per-trial correlation is computed per sub-band and **averaged over sub-bands**.
+
+    ``orthogonalize=True`` (default) applies the pairwise, leakage-rejecting orthogonalisation of
+    Hipp et al. 2012 (Nat Neurosci) before correlating, symmetrised over the two directions::
+
+        Y_perp = |Im(Y * conj(X) / |X|)|,   X_perp = |Im(X * conj(Y) / |Y|)|
+        r      = 0.5 * ( corr(env(X), env(Y_perp)) + corr(env(Y), env(X_perp)) )
+
+    which removes the zero-lag shared component (volume conduction / a shared bipolar contact) that
+    inflates raw AEC. ``orthogonalize=False`` is the raw envelope correlation ``corr(env(X), env(Y))``
+    -- kept as a leakage comparator. ``kind='power'`` (default) correlates squared envelopes; the
+    per-electrode-pair correlations follow ``indices`` (pair ``k`` = ``indices[0][k]`` <->
+    ``indices[1][k]``), so ``n_pairs = len(indices[0])``.
+    """
+    from LFPAnalysis.pac_utils import _filter_hilbert  # local import: avoids a module-load cycle
+
+    if kind not in ("power", "amplitude"):
+        raise ValueError(f"kind must be 'power' or 'amplitude', got {kind!r}")
+    if n_subbands < 1:
+        raise ValueError(f"n_subbands must be >= 1, got {n_subbands}")
+
+    sfreq = float(mne_data.info["sfreq"])
+    dat = mne_data.get_data(copy=True)          # (n_ep, n_ch, n_t)
+    n_ep, _, n_t = dat.shape
+    times = mne_data.times
+
+    srcs, tgts = np.asarray(indices[0]), np.asarray(indices[1])
+    npair = len(srcs)
+    # Filter only the channels actually referenced (unique over seeds+targets), then remap indices.
+    used = np.unique(np.concatenate([srcs, tgts]))
+    pos = {int(c): i for i, c in enumerate(used)}
+    dat = dat[:, used, :]
+    srcs = np.array([pos[int(c)] for c in srcs])
+    tgts = np.array([pos[int(c)] for c in tgts])
+
+    if (tmin is not None) or (tmax is not None):
+        lo = -np.inf if tmin is None else tmin
+        hi = np.inf if tmax is None else tmax
+        tmask = (times >= lo) & (times < hi)
+    else:
+        tmask = np.ones(n_t, dtype=bool)
+
+    edges = np.linspace(band[0], band[1], n_subbands + 1)
+    tiny = np.finfo(float).tiny
+    acc = np.zeros((n_ep, npair), dtype=float)
+    cnt = np.zeros((n_ep, npair), dtype=float)
+
+    for lo_e, hi_e in zip(edges[:-1], edges[1:]):
+        analytic = _filter_hilbert(dat, sfreq, (float(lo_e), float(hi_e)),
+                                   order=order, filter_kind=filter_kind)   # complex (n_ep, n_ch, n_t)
+        analytic = analytic[:, :, tmask]
+        for p in range(npair):
+            X = analytic[:, srcs[p], :]
+            Y = analytic[:, tgts[p], :]
+            aX, aY = np.abs(X), np.abs(Y)
+            if orthogonalize:
+                yperp = np.abs(np.imag(Y * np.conj(X) / (aX + tiny)))
+                xperp = np.abs(np.imag(X * np.conj(Y) / (aY + tiny)))
+                if kind == "power":
+                    aX, aY, yperp, xperp = aX ** 2, aY ** 2, yperp ** 2, xperp ** 2
+                r = 0.5 * (_per_trial_time_corr(aX, yperp) + _per_trial_time_corr(aY, xperp))
+            else:
+                if kind == "power":
+                    aX, aY = aX ** 2, aY ** 2
+                r = _per_trial_time_corr(aX, aY)
+            valid = np.isfinite(r)
+            acc[valid, p] += r[valid]
+            cnt[valid, p] += 1
+
+    with np.errstate(invalid="ignore"):
+        out = np.where(cnt > 0, acc / np.where(cnt > 0, cnt, 1), np.nan)
+    return out
+
+
 def compute_surr_connectivity_epochs(mne_data, indices, metric, band, freqs, n_cycles, gc_n_lags=15, buf_ms=1000):
 
     n_pairs = len(indices[0])

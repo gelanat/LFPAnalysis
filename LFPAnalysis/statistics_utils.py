@@ -400,5 +400,94 @@ def mixed_effects_electrodes(model_df, predictor, re_var='participant', plot=Tru
 #         return band_regress_df
 #     # print(f'done with subject {subj_id} channel {chan_name}')
 
+
+def nested_ols_incremental_f(Y, X_reduced, X_target, *, add_intercept=False):
+    """Column-wise nested-model incremental F + partial R^2 for a continuous response matrix.
+
+    Fits two nested OLS models to EVERY column of ``Y`` at once::
+
+        reduced :  y ~ X_reduced
+        full    :  y ~ [X_reduced | X_target]
+
+    and returns, per response column, the incremental F for the ``X_target`` block and the
+    partial R^2 it explains beyond ``X_reduced``. The incremental F is identical to statsmodels'
+    ``full.compare_f_test(reduced)`` (an exact analytic nested-F), but because all columns share
+    the same design the whole matrix is solved in two least-squares calls rather than one
+    statsmodels fit per column -- orders of magnitude faster when ``Y`` has hundreds of columns
+    (per-contact, per-band power) and the test is repeated over a permutation null.
+
+    This is the continuous-response (Gaussian, firing-rate / band-power) analogue of the
+    single-unit OLS nested-F encoding test -- ``m1.compare_f_test(m0)`` on ``fr ~ target + drift``
+    vs ``fr ~ drift`` -- used as the model-comparison convention in the SNT single-unit pipeline
+    (``snt_su_utils_canonical_circ.analyze_1d_tuning``). Use it to ask whether a behavioural term
+    (angle ``[cos, sin]``, distance ``[V_z, V_z^2]`` ...) improves the fit of a neural signal
+    beyond a nuisance design (drift, character, the other coordinate).
+
+    Parameters
+    ----------
+    Y : array (n_obs,) or (n_obs, n_resp)
+        Response column(s). A 1-D vector is treated as a single response.
+    X_reduced : array (n_obs, p0)
+        Reduced/nuisance design. Pass your own intercept column, or set ``add_intercept=True``.
+    X_target : array (n_obs, q)
+        The term block whose incremental contribution is tested (numerator df = its rank).
+    add_intercept : bool, default False
+        Prepend a column of ones to BOTH designs.
+
+    Returns
+    -------
+    dict with keys
+        ``F`` : (n_resp,) incremental F for ``X_target`` per response column.
+        ``partial_r2`` : (n_resp,) ``(SSE_reduced - SSE_full) / SSE_reduced`` per column.
+        ``df_num`` : int, numerator df (rank added by ``X_target``).
+        ``df_den`` : int, denominator df (``n_obs - rank(full)``).
+        ``sse_reduced``, ``sse_full`` : (n_resp,) residual sums of squares.
+
+    Notes
+    -----
+    df are computed from the numerical ranks of the designs, so rank-deficient (collinear dummy)
+    columns are handled correctly. Columns of ``Y`` with zero reduced-model residual variance yield
+    ``partial_r2 = 0`` and ``F = 0`` rather than NaN. No standardisation is applied; both F and
+    partial R^2 are scale-invariant in ``Y``. The target block is NOT residualised on the reduced
+    design here -- the full model does that internally -- so pass raw term columns.
+    """
+    Y = np.asarray(Y, float)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    X0 = np.asarray(X_reduced, float)
+    if X0.ndim == 1:
+        X0 = X0[:, None]
+    Xt = np.asarray(X_target, float)
+    if Xt.ndim == 1:
+        Xt = Xt[:, None]
+    n = Y.shape[0]
+    if not (X0.shape[0] == Xt.shape[0] == n):
+        raise ValueError("Y, X_reduced, X_target must share the first (observation) axis")
+    if add_intercept:
+        X0 = np.hstack([np.ones((n, 1)), X0])
+    X1 = np.hstack([X0, Xt])
+
+    def _sse(X):
+        beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        resid = Y - X @ beta
+        return np.einsum("ij,ij->j", resid, resid)
+
+    sse0 = _sse(X0)
+    sse1 = _sse(X1)
+    df_num = int(np.linalg.matrix_rank(X1) - np.linalg.matrix_rank(X0))
+    df_den = int(n - np.linalg.matrix_rank(X1))
+    F = np.zeros(Y.shape[1], float)
+    partial = np.zeros(Y.shape[1], float)
+    if df_num > 0 and df_den > 0:
+        gain = sse0 - sse1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            partial = np.where(sse0 > 0, gain / sse0, 0.0)
+            denom = sse1 / df_den
+            F = np.where(denom > 0, (gain / df_num) / denom, 0.0)
+    partial = np.where(np.isfinite(partial), partial, 0.0)
+    F = np.where(np.isfinite(F), F, 0.0)
+    return dict(F=F, partial_r2=partial, df_num=df_num, df_den=df_den,
+                sse_reduced=sse0, sse_full=sse1)
+
     
 

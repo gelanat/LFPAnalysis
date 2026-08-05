@@ -1975,22 +1975,25 @@ def _bin_channelwise_times_into_behav_evs(channel_dict_seconds, ev_starts, ev_en
         # Initialize a dictionary to store the assigned timestamps for each time bin
         assigned_timestamps = {bin_index: [] for bin_index in range(len(time_bins))}
 
-        # Iterate through each timestamp and assign it to the appropriate time bin
-        for timestamp in timestamps:
-            for bin_index, (start, end) in enumerate(time_bins):
-                if start <= timestamp <= end:
-                    assigned_timestamps[bin_index].append(timestamp - start)
-                    break
+        # Channels with no detected events are stored as a scalar NaN; treat as
+        # having no timestamps (all bins stay empty) instead of iterating a float.
+        if np.ndim(timestamps) > 0:
+            # Iterate through each timestamp and assign it to the appropriate time bin
+            for timestamp in timestamps:
+                for bin_index, (start, end) in enumerate(time_bins):
+                    if start <= timestamp <= end:
+                        assigned_timestamps[bin_index].append(timestamp - start)
+                        break
         allts[key] = assigned_timestamps
     # Turn the dictionary into a metadata dataframe 
     event_metadata = pd.DataFrame(columns=list(channel_dict_seconds.keys()), index=np.arange(len(time_bins)))
     for ch in list(channel_dict_seconds.keys()):
         for ev, val in allts[ch].items():
-            if len(val) > 1:    
+            # val is a list of in-window timestamps; store only non-empty bins
+            # (empty bins remain NaN). The old `~np.isnan(val)` raised on an
+            # empty list ("truth value of an empty array is ambiguous").
+            if len(val) > 0:
                 event_metadata[ch].loc[ev] = val
-            else:
-                if ~np.isnan(val): 
-                    event_metadata[ch].loc[ev] = val
     # Replace all nan with Nones 
     event_metadata.where(pd.notna(event_metadata), None)
     return event_metadata
@@ -2065,8 +2068,11 @@ detrend=None):
     # any NaN's (e.g. non-responses) should be removed. make sure to remove from the dataframes during later analysis too. 
     beh_ts = [x for x in beh_ts if ~np.isnan(x)]
     
-    # Bin these times into the epoched bins
-    ev_starts = [x - ev_start_s for x in beh_ts]
+    # Bin these times into the epoched bins. ev_start_s is the SIGNED offset of
+    # the window start (negative for a pre-anchor window), matching the epoch
+    # tmin below (ev_start_s - buf_s). Using `x - ev_start_s` inverts the window
+    # for any pre-anchor baseline (start > end), producing all-empty bins.
+    ev_starts = [x + ev_start_s for x in beh_ts]
     ev_ends = [x + ev_end_s for x in beh_ts]
 
     IED_df = _bin_channelwise_times_into_behav_evs(IED_sec_dict, ev_starts, ev_ends)
